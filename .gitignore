@@ -1,0 +1,12 @@
+# Local working log — never goes into the repo
+progress.md
+
+# Downloaded artifacts: PokeAPI responses and sprites are fetched on demand
+assets/cache/
+assets/sprites/
+
+# Build output
+app/.build/
+app/*.app
+*.o
+.DS_Store
