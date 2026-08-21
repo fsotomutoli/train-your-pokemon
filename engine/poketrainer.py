@@ -462,23 +462,32 @@ def main():
         state = load_state()
         active = state.get("active")
         force = "--force" in sys.argv
+        keep_xp = "--keep-xp" in sys.argv
+        carried_xp = active["xp"] if (active and keep_xp) else 0
 
-        # Swapping resets XP to zero. Only allow it once the current Pokemon is
-        # maxed out (and therefore already stored in the Pokedex), so progress
-        # can never be discarded by accident.
-        if active and active["level"] < MAX_LEVEL and not force:
+        # Swapping normally resets XP to zero, so it is only allowed once the
+        # current Pokemon is maxed out (and therefore already in the Pokedex).
+        # With --keep-xp nothing is discarded, so the guard does not apply.
+        if active and active["level"] < MAX_LEVEL and not force and not keep_xp:
             print(f"{active['name'].capitalize()} is at level {active['level']}, "
                   f"not {MAX_LEVEL}. Swapping now would discard "
-                  f"{active['xp']:,} XP. Pass --force to override.")
+                  f"{active['xp']:,} XP. Pass --force to discard it, or "
+                  f"--keep-xp to carry it over.")
             return 1
 
         ensure_active(state, species_id=int(sys.argv[2]))
+        if carried_xp:
+            # apply_xp recomputes the level from total XP and applies whatever
+            # evolutions that level has already earned on the new line.
+            apply_xp(state, carried_xp)
+
         # Must refresh here: the statusline and the menu bar read the cached
         # display block, so without this they would keep showing the old
         # Pokemon until the next scan.
         update_display(state)
         save_state(state)
-        print(f"New active: {state['active']['name']}")
+        new = state["active"]
+        print(f"New active: {new['name']} Lv.{new['level']} ({new['xp']:,} XP)")
 
     else:
         print(__doc__)
