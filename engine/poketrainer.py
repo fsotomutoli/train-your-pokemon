@@ -504,6 +504,21 @@ def ensure_active(state, species_id=None):
     return state["active"]
 
 
+def _current_stage_index(active):
+    """Which stage of its line the Pokemon is currently at.
+
+    Matched against every option of a stage, not just its label, so a Pokemon
+    that took a branch (Umbreon, not the first-listed Vaporeon) is still found.
+    """
+    for index, stage in enumerate(active["line"]):
+        if index == 0:
+            if stage["species_id"] == active["species_id"]:
+                return 0
+        elif any(o["species_id"] == active["species_id"] for o in stage["options"]):
+            return index
+    return 0
+
+
 def apply_xp(state, gained_xp, cap_level=None):
     """Add XP to the active Pokemon, evolve it, and catch it at level 100.
 
@@ -532,45 +547,30 @@ def apply_xp(state, gained_xp, cap_level=None):
     if any("options" not in stage for stage in active["line"]):
         active["line"] = evolution_line(active["base_species_id"])
 
-    # Walk forward through the stages whose level has been reached. A stage with
-    # several options stops the walk until the trainer picks one, so an Eevee is
-    # never silently turned into whichever branch happened to come first.
-    choices = active.setdefault("choices", {})
-    active["pending_evolution"] = None
-    target = active["line"][0]
+    # Evolution never happens on its own, not even when a stage has a single
+    # option. Reaching the level only marks it pending; the panel plays the
+    # evolution animation and that is what commits it. Doing it here would mean
+    # the trainer is told about a change they never got to watch.
+    index = _current_stage_index(active)
+    following = index + 1
+    pending = None
+    if following < len(active["line"]):
+        stage = active["line"][following]
+        if active["level"] >= stage["min_level"]:
+            pending = {
+                "stage": following,
+                "level": stage["min_level"],
+                "options": stage["options"],
+            }
+    active["pending_evolution"] = pending
 
-    for index, stage in enumerate(active["line"]):
-        if index == 0:
-            continue
-        if active["level"] < stage["min_level"]:
-            break
-        if len(stage["options"]) > 1:
-            chosen = choices.get(str(index))
-            if chosen is None:
-                active["pending_evolution"] = {
-                    "stage": index,
-                    "level": stage["min_level"],
-                    "options": stage["options"],
-                }
-                break
-            target = next(o for o in stage["options"] if o["species_id"] == chosen)
-        else:
-            target = stage["options"][0]
-
-    if target["species_id"] != active["species_id"]:
-        events.append({"type": "evolution", "from": active["name"], "to": target["name"],
-                       "species_id": target["species_id"],
-                       "at": datetime.now(timezone.utc).isoformat()})
-        active["species_id"] = target["species_id"]
-        active["name"] = target["name"]
-
-    # Heads-up one level before evolving, so the change is not a surprise.
-    upcoming = next((s for s in active["line"]
-                     if s["min_level"] and s["min_level"] > active["level"]), None)
-    if upcoming and active["level"] >= upcoming["min_level"] - 1:
-        events.append({"type": "pre_evolution", "from": active["name"],
-                       "to": upcoming["name"], "level": upcoming["min_level"],
-                       "at_level": active["level"],
+    # Announced once per stage, so a scan every 30 seconds does not repeat it.
+    if pending and active.get("announced_stage") != pending["stage"]:
+        active["announced_stage"] = pending["stage"]
+        events.append({"type": "ready_to_evolve",
+                       "who": active["name"],
+                       "level": pending["level"],
+                       "choices": len(pending["options"]),
                        "at": datetime.now(timezone.utc).isoformat()})
 
     # Level 100: goes into the Pokedex and becomes swappable.
@@ -861,20 +861,39 @@ def main():
             print("No evolution is waiting for a choice.")
             return 1
 
-        wanted = int(sys.argv[2])
-        valid = {o["species_id"] for o in pending["options"]}
-        if wanted not in valid:
+        # With a single option the id may be omitted: the panel calls it that
+        # way once the animation finishes.
+        if len(sys.argv) > 2:
+            wanted = int(sys.argv[2])
+        elif len(pending["options"]) == 1:
+            wanted = pending["options"][0]["species_id"]
+        else:
+            names = ", ".join(f"{o['name']} ({o['species_id']})" for o in pending["options"])
+            print(f"This stage branches. Choose from: {names}")
+            return 1
+
+        target = next((o for o in pending["options"] if o["species_id"] == wanted), None)
+        if target is None:
             names = ", ".join(f"{o['name']} ({o['species_id']})" for o in pending["options"])
             print(f"{wanted} is not one of the options. Choose from: {names}")
             return 1
 
+        was = active["name"]
         active.setdefault("choices", {})[str(pending["stage"])] = wanted
-        events = apply_xp(state, 0)
+        active["species_id"] = target["species_id"]
+        active["name"] = target["name"]
+        active["announced_stage"] = None
+
+        events = [{"type": "evolution", "from": was, "to": target["name"],
+                   "species_id": target["species_id"],
+                   "at": datetime.now(timezone.utc).isoformat()}]
+        # Recomputes level, catches at 100, and re-checks whether the new form
+        # already qualifies for the stage after this one.
+        events += apply_xp(state, 0)
+        state["events"] = (state.get("events", []) + events)[-50:]
         update_display(state)
         save_state(state)
-        print(f"Now: {state['active']['name']} Lv.{state['active']['level']}")
-        for event in events:
-            print(f"  {event['type']}")
+        print(f"{was} -> {state['active']['name']} Lv.{state['active']['level']}")
 
     elif command == "test-notification":
         # Appends a synthetic event so the menu bar app posts a real banner

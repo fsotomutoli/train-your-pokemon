@@ -123,6 +123,28 @@ enum Sprites {
                       width: CGFloat(maxX - minX + 1), height: fallback.height)
     }
 
+    /// White silhouette of a sprite, used by the evolution animation.
+    ///
+    /// The sprite is drawn onto a TRANSPARENT canvas and then filled with
+    /// `.sourceAtop`, which paints only where pixels already exist. Filling a
+    /// background first instead would tint the background too and return a
+    /// solid white rectangle.
+    static func silhouette(_ path: String) -> NSImage? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let rep = NSBitmapImageRep(data: data) else { return nil }
+        rep.setProperty(.currentFrame, withValue: 0)
+
+        let box = NSRect(x: 0, y: 0, width: rep.pixelsWide, height: rep.pixelsHigh)
+        let image = NSImage(size: box.size)
+        image.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .none
+        rep.draw(in: box)
+        NSColor.white.setFill()
+        box.fill(using: .sourceAtop)
+        image.unlockFocus()
+        return image
+    }
+
     static func image(_ path: String?) -> NSImage? {
         guard let path, FileManager.default.fileExists(atPath: path) else { return nil }
         return NSImage(contentsOfFile: path)
