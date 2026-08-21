@@ -68,6 +68,7 @@ struct TrainerEvent: Decodable {
     var level: Int?
     var at_level: Int?
     var species_id: Int?
+    var choices: Int?
 }
 
 /// Wrapper that turns an undecodable element into nil instead of failing the
@@ -183,18 +184,16 @@ final class Trainer: ObservableObject {
 
         for event in fresh {
             switch event.type {
-            case "pre_evolution":
-                guard let from = event.from, let to = event.to, let level = event.level else { continue }
-                Notifier.post(title: "Train Your Pokemon",
-                              subtitle: "\(from.capitalized) Lv.\(event.at_level ?? 0)",
-                              body: "Está a punto de evolucionar a \(to.capitalized) en el nivel \(level).")
-
-            case "evolution":
-                guard let from = event.from, let to = event.to else { continue }
-                Notifier.post(title: "¡Evolución!",
-                              subtitle: "\(from.capitalized) → \(to.capitalized)",
-                              body: "Tu \(from.capitalized) evolucionó a \(to.capitalized).")
-                playCry(speciesID: event.species_id)
+            // Evolution waits for the panel, so this is an invitation rather
+            // than an announcement: the change has not happened yet.
+            case "ready_to_evolve":
+                guard let who = event.who else { continue }
+                let branches = (event.choices ?? 1) > 1
+                Notifier.post(title: "¡\(who.capitalized) está listo para evolucionar!",
+                              subtitle: "Nivel \(event.level ?? 0)",
+                              body: branches
+                                    ? "Abre la barra de menús para elegir su forma."
+                                    : "Abre la barra de menús para verlo evolucionar.")
 
             case "caught":
                 guard let who = event.who else { continue }
@@ -328,6 +327,8 @@ struct TrainerPanel: View {
     /// The picker is shared: it either swaps who is being trained, or spends a
     /// project reward. This says which.
     @State private var claiming = false
+    /// Form the animation is currently morphing into, once chosen.
+    @State private var evolvingTo: EvolutionOption?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -384,7 +385,11 @@ struct TrainerPanel: View {
                 Button {
                     route = .evolution
                 } label: {
-                    Label("¡Listo para evolucionar! Elige entre \(pending.options.count)",
+                    // Names what will actually happen. "Elige entre 1" made no
+                    // sense on the single-option case, which is most of them.
+                    Label(pending.options.count > 1
+                          ? "Elegir evolución · \(pending.options.count) formas"
+                          : "Evolucionar a \(pending.options.first?.name.capitalized ?? "")",
                           systemImage: "sparkles")
                         .frame(maxWidth: .infinity)
                 }
@@ -509,18 +514,45 @@ struct TrainerPanel: View {
     @ViewBuilder
     private var evolutionView: some View {
         if let pending = trainer.state.display?.pending_evolution {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Elige su evolución").font(.headline)
-                Text("Alcanzó el nivel \(pending.level). Esta decisión es definitiva.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            // One option evolves straight away; a branch asks first, then the
+            // animation plays for whichever form was picked.
+            if let target = evolvingTo ?? (pending.options.count == 1 ? pending.options.first : nil),
+               let fromPath = trainer.state.display?.sprites["animated"],
+               let toPath = target.spritePath {
+                VStack(spacing: 8) {
+                    EvolutionAnimation(fromPath: fromPath, toPath: toPath) {
+                        trainer.evolve(into: target.species_id)
+                        evolvingTo = nil
+                        route = .active
+                    }
+                    Text("¿Qué? ¡\(trainer.state.display?.name.capitalized ?? "") está evolucionando!")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(height: 150)
+            } else {
+                branchPicker(pending)
+            }
+        } else {
+            // Resolved elsewhere (CLI, or a second click).
+            Color.clear.frame(height: 1).onAppear { route = .active }
+        }
+    }
+
+    private func branchPicker(_ pending: PendingEvolution) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Elige su evolución").font(.headline)
+            Text("Alcanzó el nivel \(pending.level). Esta decisión es definitiva.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
 
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
                         ForEach(pending.options) { option in
                             Button {
-                                trainer.evolve(into: option.species_id)
-                                route = .active
+                                // Hands off to the animation; the evolution is
+                                // committed when it finishes.
+                                evolvingTo = option
                             } label: {
                                 VStack(spacing: 2) {
                                     if let image = Sprites.image(option.spritePath) {
@@ -540,13 +572,9 @@ struct TrainerPanel: View {
                 }
                 .frame(maxHeight: 200)
 
-                Button("‹ Decidir después") { route = .active }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-            }
-        } else {
-            // The choice was resolved elsewhere (CLI, or another click).
-            Color.clear.frame(height: 1).onAppear { route = .active }
+            Button("‹ Decidir después") { route = .active }
+                .buttonStyle(.borderless)
+                .font(.caption)
         }
     }
 
