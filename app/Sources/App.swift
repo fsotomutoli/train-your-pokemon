@@ -34,6 +34,8 @@ struct Display: Decodable {
     var caught: Int
     var commits: Int?
     var unclaimed: Int?
+    var can_retire: Bool?
+    var retire_level: Int?
     var next_evo: String?
     var next_evo_level: Int?
     var sprites: [String: String]
@@ -46,11 +48,16 @@ struct PokedexEntry: Decodable, Identifiable {
     var name: String
     var level: Int
     var source: String?
+    var maxed: Bool?
     var id: Int { species_id }
 
-    /// Trained to 100 versus awarded for starting a project, so the Pokedex
-    /// keeps showing what was actually raised.
-    var badge: String { source == "project" ? "Obtenido" : "Lv.\(level)" }
+    /// Distinguishes what was awarded, what was retired early, and what was
+    /// pushed all the way to 100 — the pace is the trainer's choice, so the
+    /// Pokedex has to show which choice each entry represents.
+    var badge: String {
+        if source == "project" { return "Obtenido" }
+        return maxed == true ? "★ Lv.100" : "Lv.\(level)"
+    }
 }
 
 struct Candidate: Decodable, Identifiable {
@@ -240,6 +247,19 @@ final class Trainer: ObservableObject {
         try? process.run()
     }
 
+    /// Files the current Pokemon in the Pokedex and starts the next one. Both
+    /// happen at once so the panel is never left without an active Pokemon.
+    func retire(startingWith speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["retire", String(speciesID)])
+            Self.runEngine(["candidates"])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
     /// Spends a project reward on a species, which goes straight to the Pokedex.
     func claim(_ speciesID: Int) {
         Task.detached(priority: .userInitiated) {
@@ -329,6 +349,8 @@ struct TrainerPanel: View {
     @State private var claiming = false
     /// Form the animation is currently morphing into, once chosen.
     @State private var evolvingTo: EvolutionOption?
+    /// The picker is retiring the current Pokemon rather than claiming a reward.
+    @State private var retiring = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -438,21 +460,27 @@ struct TrainerPanel: View {
                     .frame(maxWidth: .infinity)
             }
 
-            // Swapping resets XP, so it is only offered once the current
-            // Pokemon is maxed out and already stored in the Pokedex. The
-            // engine enforces the same rule independently.
-            if display.level >= 100 {
+            // Retiring files the Pokemon at whatever level it reached and
+            // starts the next one. The floor exists so an entry still means
+            // something; the engine enforces it independently.
+            if display.can_retire == true {
                 Button {
                     trainer.loadCandidates()
+                    retiring = true
                     route = .picker
                 } label: {
-                    Label("Entrenar otro Pokémon", systemImage: "arrow.triangle.2.circlepath")
+                    Label(display.level >= 100
+                          ? "Retirar y entrenar otro"
+                          : "Retirar en Lv.\(display.level) y entrenar otro",
+                          systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                // A ternary of two styles will not typecheck: they are
+                // different types. The prominent slot belongs to evolution.
+                .buttonStyle(.bordered)
                 .padding(.top, 6)
             } else {
-                Text("Podrás cambiar de Pokémon al llegar a nivel 100.")
+                Text("Podrás retirarlo desde el nivel \(display.retire_level ?? 50).")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .padding(.top, 6)
@@ -607,6 +635,9 @@ struct TrainerPanel: View {
                                 if claiming {
                                     trainer.claim(candidate.species_id)
                                     claiming = false
+                                } else if retiring {
+                                    trainer.retire(startingWith: candidate.species_id)
+                                    retiring = false
                                 } else {
                                     trainer.swap(to: candidate.species_id)
                                 }

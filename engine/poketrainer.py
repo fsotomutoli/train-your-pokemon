@@ -49,6 +49,16 @@ FIXED_EVO_LEVEL = 40
 
 MAX_LEVEL = 100
 
+# Lowest level a Pokemon may be retired at.
+#
+# The XP curve is cubic, so half the total is spent between level 80 and 100 and
+# a Pokedex gated on 100 grows about nine entries a year — a pace that reads as
+# an achievement rather than a collection. Retiring early hands that pace to the
+# trainer instead, but with no floor the whole roster could be retired at level 1
+# in an afternoon, which is the clutter problem all over again. Level 50 is about
+# two active days: enough that an entry means something.
+MIN_RETIRE_LEVEL = 50
+
 # Ceiling for XP granted by a backfill. Replaying a long history otherwise hands
 # the very first Pokemon a nearly free run to 100, which makes every later one
 # feel like a wall.
@@ -654,6 +664,10 @@ def update_display(state):
         "commits": state["totals"].get("commits", 0),
         # Rewards from new projects, waiting for a species to be picked.
         "unclaimed": state.get("unclaimed", 0),
+        # The trainer sets the pace: retire early for a wider Pokedex, or push
+        # to 100 for the badge.
+        "can_retire": level >= MIN_RETIRE_LEVEL,
+        "retire_level": MIN_RETIRE_LEVEL,
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
         # Set when the Pokemon has reached a branching stage and is waiting for
@@ -824,6 +838,40 @@ def main():
         state["candidates"] = candidates(state)
         save_state(state)
         print(f"{len(state['candidates'])} available")
+
+    elif command == "retire":
+        # Retires the active Pokemon into the Pokedex at whatever level it
+        # reached and starts the next one, in a single step. Doing both at once
+        # avoids ever having no active Pokemon, which the panel has no state for.
+        state = load_state()
+        active = state.get("active")
+        if not active:
+            print("Nothing to retire.")
+            return 1
+        if active["level"] < MIN_RETIRE_LEVEL:
+            print(f"{active['name'].capitalize()} is level {active['level']}. "
+                  f"Retiring needs level {MIN_RETIRE_LEVEL}.")
+            return 1
+        if len(sys.argv) < 3:
+            print("Name the species to train next: retire <species_id>")
+            return 1
+
+        # Reaching 100 already files it, so avoid a duplicate entry.
+        if not any(p["species_id"] == active["species_id"] for p in state["pokedex"]):
+            state["pokedex"].append({
+                "species_id": active["species_id"],
+                "name": active["name"],
+                "level": active["level"],
+                "source": "trained",
+                "maxed": active["level"] >= MAX_LEVEL,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+        retired = f"{active['name']} Lv.{active['level']}"
+
+        ensure_active(state, species_id=int(sys.argv[2]))
+        update_display(state)
+        save_state(state)
+        print(f"Retired {retired}. Now training {state['active']['name']}.")
 
     elif command == "claim":
         # Spends a reward earned by starting a new project. The Pokemon goes
