@@ -23,9 +23,14 @@ enum Sprites {
     /// for both body plans.
     static let cropAnchor: CGFloat = 0.34
 
-    /// Widest the icon may get. A normal menu bar icon is ~24pt, so this
-    /// leaves room for the level text beside it.
+    /// Widest the sprite itself may get. A normal menu bar icon is ~24pt, so
+    /// this leaves room for the level text beside it.
     static let maxWidth: CGFloat = 36
+
+    /// Transparent space added to the right of the sprite. MenuBarExtra places
+    /// the level text flush against the icon, which left Charizard's wing
+    /// touching the "L"; padding the canvas is what separates them.
+    static let trailingGap: CGFloat = 6
 
     /// Menu bar icon: the head of the sprite, scaled to fill the bar height.
     static func menuBarIcon(_ path: String,
@@ -72,7 +77,9 @@ enum Sprites {
 
         let width = max(1, (cropped.width * scale).rounded())
 
-        let image = NSImage(size: NSSize(width: width, height: canvas))
+        // Canvas is wider than the sprite; the sprite is drawn at x = 0 so the
+        // extra room lands on the right, between it and the level text.
+        let image = NSImage(size: NSSize(width: width + trailingGap, height: canvas))
         image.lockFocus()
         // Nearest-neighbour keeps pixel art crisp instead of blurring it.
         NSGraphicsContext.current?.imageInterpolation = .none
