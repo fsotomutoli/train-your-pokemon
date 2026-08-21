@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,19 +57,28 @@ MAX_LEVEL = 100
 # a Pokedex gated on 100 grows about nine entries a year — a pace that reads as
 # an achievement rather than a collection. Retiring early hands that pace to the
 # trainer instead, but with no floor the whole roster could be retired at level 1
-# in an afternoon, which is the clutter problem all over again. Level 50 is about
-# two active days: enough that an entry means something.
-MIN_RETIRE_LEVEL = 50
+# in an afternoon, which is the clutter problem all over again.
+#
+# 40 is where a Pokemon is actually finished: sampling 120 chains, 98% have
+# fully evolved by then and the median last evolution is level 34.5. An earlier
+# floor of 50 sat ten levels past the point where anything still happens, so it
+# only bought grind. At roughly one active day per entry it also keeps the
+# collection reachable — 328 species is a decade at level 60, a couple of years
+# here.
+MIN_RETIRE_LEVEL = 40
 
 # Odds of a new Pokemon being shiny, as one in N. Rolled once when a species
 # starts being trained or is claimed, never on evolution: shininess is inherited,
 # so a shiny Charmander yields a shiny Charizard.
 #
-# The games use 1/8192, which at this cadence means never. At roughly forty
-# encounters a year — the pace of retiring around level 60 — one in ten lands
-# near four a year. Retiring later means fewer encounters and fewer shinies,
-# which is the intended trade: hunting them costs Pokedex quality.
-SHINY_CHANCE = 10
+# The games use 1/8192, which at this cadence means never.
+#
+# Calibrated against retiring at the floor, which is where most retirements will
+# land since that is where a Pokemon has finished evolving: about 183 encounters
+# a year, so one in 45 gives roughly four. Retiring later means fewer encounters
+# and fewer shinies, which is the intended trade rather than a flaw — hunting
+# them costs Pokedex quality.
+SHINY_CHANCE = 45
 
 # Ceiling for XP granted by a backfill. Replaying a long history otherwise hands
 # the very first Pokemon a nearly free run to 100, which makes every later one
@@ -711,7 +721,12 @@ def update_display(state):
     os.replace(tmp, STATUSLINE_PATH)
 
 
-GEN1_MAX = 151
+# Highest species id offered for training. 649 is the end of generation V, and
+# it is exactly where the animated pixel sprites stop: from 650 on only the
+# 475px official artwork exists, which looks out of place beside pixel art in
+# the menu bar and the grid. PokeAPI itself goes to 1025.
+MAX_SPECIES_ID = 649
+
 CANDIDATES_PATH = CACHE_DIR / "candidates.json"
 
 
@@ -727,18 +742,22 @@ def base_forms():
             return json.load(fh)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    listing = _get_json(f"{POKEAPI}/evolution-chain?limit=80", "chain-list")
+    listing = _get_json(f"{POKEAPI}/evolution-chain?limit=2000", "chain-list")
 
-    forms = []
-    for entry in listing["results"]:
-        chain_id = _id_from_url(entry["url"])
+    def base_of(entry):
         try:
-            chain = get_evolution_chain(chain_id)["chain"]
+            chain = get_evolution_chain(_id_from_url(entry["url"]))["chain"]
         except Exception:
-            continue
+            return None
         species_id = _id_from_url(chain["species"]["url"])
-        if species_id <= GEN1_MAX:
-            forms.append({"species_id": species_id, "name": chain["species"]["name"]})
+        if species_id > MAX_SPECIES_ID:
+            return None
+        return {"species_id": species_id, "name": chain["species"]["name"]}
+
+    # Hundreds of chains, one request each: serially this takes ~13 minutes.
+    # Eight workers keeps it to a couple while staying polite to the API.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        forms = [f for f in pool.map(base_of, listing["results"]) if f]
 
     forms.sort(key=lambda f: f["species_id"])
     with open(CANDIDATES_PATH, "w") as fh:
@@ -758,11 +777,16 @@ def candidates(state):
             continue
 
     available = [f for f in base_forms() if f["species_id"] not in caught_bases]
-    for form in available:
-        # Only the small sprite: the grid never shows the 475px artwork, and
-        # fetching both for ~70 species is what made the first run take 2min.
+
+    # Only the small sprite: the grid never shows the 475px artwork, and
+    # fetching both is what made an early version crawl. Parallel for the same
+    # reason as the chain walk — there are hundreds of these.
+    def with_sprite(form):
         form["sprites"] = ensure_sprites(form["species_id"], kinds=("animated",))
-    return available
+        return form
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(with_sprite, available))
 
 
 def scan(from_scratch=False):
