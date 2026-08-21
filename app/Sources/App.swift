@@ -32,6 +32,8 @@ struct Display: Decodable {
     var emoji: String
     var today_xp: Int
     var caught: Int
+    var commits: Int?
+    var unclaimed: Int?
     var next_evo: String?
     var next_evo_level: Int?
     var sprites: [String: String]
@@ -43,7 +45,12 @@ struct PokedexEntry: Decodable, Identifiable {
     var species_id: Int
     var name: String
     var level: Int
+    var source: String?
     var id: Int { species_id }
+
+    /// Trained to 100 versus awarded for starting a project, so the Pokedex
+    /// keeps showing what was actually raised.
+    var badge: String { source == "project" ? "Obtenido" : "Lv.\(level)" }
 }
 
 struct Candidate: Decodable, Identifiable {
@@ -234,6 +241,18 @@ final class Trainer: ObservableObject {
         try? process.run()
     }
 
+    /// Spends a project reward on a species, which goes straight to the Pokedex.
+    func claim(_ speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["claim", String(speciesID)])
+            Self.runEngine(["candidates"])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
     /// Resolves a branching evolution once the trainer picks a form.
     func evolve(into speciesID: Int) {
         Task.detached(priority: .userInitiated) {
@@ -306,6 +325,9 @@ struct XPBar: View {
 struct TrainerPanel: View {
     @ObservedObject var trainer: Trainer
     @State private var route: PanelRoute = .active
+    /// The picker is shared: it either swaps who is being trained, or spends a
+    /// project reward. This says which.
+    @State private var claiming = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -380,10 +402,27 @@ struct TrainerPanel: View {
             HStack {
                 Label("\(display.today_xp.formatted()) XP hoy", systemImage: "bolt.fill")
                 Spacer()
+                Label("\(display.commits ?? 0)", systemImage: "arrow.triangle.branch")
+                Spacer()
                 Label("\(display.caught)", systemImage: "checkmark.seal.fill")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+
+            // Earned by starting a new project. Rare enough to be worth a
+            // whole Pokemon without crowding the Pokedex.
+            if let unclaimed = display.unclaimed, unclaimed > 0 {
+                Button {
+                    trainer.loadCandidates()
+                    claiming = true
+                    route = .picker
+                } label: {
+                    Label("\(unclaimed) Pokémon por reclamar", systemImage: "gift.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 8)
+            }
 
             Divider().padding(.vertical, 10)
 
@@ -454,7 +493,7 @@ struct TrainerPanel: View {
                             }
                             Text(entry.name.capitalized)
                                 .font(.system(size: 8)).lineLimit(1)
-                            Text("Lv.\(entry.level)")
+                            Text(entry.badge)
                                 .font(.system(size: 8)).foregroundStyle(.secondary)
                         }
                     }
@@ -514,13 +553,15 @@ struct TrainerPanel: View {
     private var pickerView: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Elegir Pokémon").font(.headline)
+                Text(claiming ? "Reclamar Pokémon" : "Elegir Pokémon").font(.headline)
                 Spacer()
                 Text("\(trainer.state.candidates.count) disponibles")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Text("Empieza en nivel 1 desde la base de su línea evolutiva.")
+            Text(claiming
+                 ? "Entra directo a tu Pokédex, marcado como obtenido."
+                 : "Empieza en nivel 1 desde la base de su línea evolutiva.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
@@ -535,7 +576,12 @@ struct TrainerPanel: View {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
                         ForEach(trainer.state.candidates) { candidate in
                             Button {
-                                trainer.swap(to: candidate.species_id)
+                                if claiming {
+                                    trainer.claim(candidate.species_id)
+                                    claiming = false
+                                } else {
+                                    trainer.swap(to: candidate.species_id)
+                                }
                                 route = .active
                             } label: {
                                 VStack(spacing: 2) {

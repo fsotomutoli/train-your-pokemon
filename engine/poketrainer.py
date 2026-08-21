@@ -13,6 +13,7 @@ Usage:
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -47,6 +48,27 @@ TOKENS_PER_XP = 50
 FIXED_EVO_LEVEL = 40
 
 MAX_LEVEL = 100
+
+# Ceiling for XP granted by a backfill. Replaying a long history otherwise hands
+# the very first Pokemon a nearly free run to 100, which makes every later one
+# feel like a wall.
+BACKFILL_MAX_LEVEL = 60
+
+# Commits grant XP, not Pokemon. They happen ~9 times a day, so handing out a
+# Pokemon per commit would bury the Pokedex under level-1 entries nobody trained
+# and drown the ones actually raised to 100. Feeding the training loop instead
+# keeps a single route into the Pokedex.
+#
+# A commit is an outcome rather than consumption, so this also dilutes the
+# incentive to burn tokens for their own sake: at the calibrated rates roughly a
+# third of XP ends up coming from work rather than spend.
+COMMIT_XP = 2000
+
+# Starting a brand new project does grant a Pokemon, because it happens a
+# handful of times a year — rare enough to stay meaningful and never clutter.
+# It is recorded with its own source so the Pokedex still shows what was trained
+# versus what was awarded.
+PROJECT_GRANTS_POKEMON = True
 
 # Duplicates of the same message.id are consecutive content blocks of one
 # request, so a short window is enough to deduplicate across scans.
@@ -333,8 +355,38 @@ def level_from_xp(xp, curve):
 # Incremental transcript reading
 # --------------------------------------------------------------------------
 
+# `git commit` only counts where a command actually starts: at the beginning of
+# the string, after a separator, or inside a substitution. Matching the bare
+# substring also caught commands that merely mention it — a shell `case` pattern
+# or an echo — which inflated the count by a quarter.
+COMMIT_PATTERN = re.compile(r"(?:^|[;&|]\s*|\$\(\s*|`\s*|\n\s*)git\s+commit\b")
+
+
+def _commits_in(message):
+    """Count git commits among a message's Bash tool calls.
+
+    Commits are read from the transcript itself rather than from git, so no repo
+    needs a hook installed and every project counts automatically.
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if block.get("name") != "Bash":
+            continue
+        command = (block.get("input") or {}).get("command", "")
+        total += len(COMMIT_PATTERN.findall(command))
+    return total
+
+
 def collect_tokens(state, from_scratch=False):
-    """Scan the .jsonl transcripts and return {date: work_tokens} for new data."""
+    """Scan the .jsonl transcripts and return {date: work_tokens} for new data.
+
+    Also counts new commits and newly seen projects, which award XP of their own.
+    """
     if from_scratch:
         state["cursors"] = {}
         state["recent_msg_ids"] = []
@@ -344,11 +396,22 @@ def collect_tokens(state, from_scratch=False):
     seen_order = list(state.get("recent_msg_ids", []))
     per_day = {}
 
+    known_projects = set(state.setdefault("projects_seen", []))
+    counts = {"commits": 0, "new_projects": 0}
+    state["_last_counts"] = counts
+
     if not PROJECTS_DIR.exists():
         return per_day
 
     for path in sorted(PROJECTS_DIR.rglob("*.jsonl")):
         key = str(path)
+        # One directory per project, so its name identifies the project without
+        # having to parse cwd out of every entry.
+        project = path.parent.name
+        if project not in known_projects:
+            known_projects.add(project)
+            counts["new_projects"] += 1
+
         try:
             size = path.stat().st_size
         except OSError:
@@ -386,6 +449,13 @@ def collect_tokens(state, from_scratch=False):
                 if not usage:
                     continue
 
+                # Counted before the dedup below, and on every line. A message is
+                # written one content block per line, all sharing one id: the
+                # thinking block lands on the first line and the tool_use on the
+                # second, so deduplicating by id first would skip every commit.
+                # Tokens still need that dedup, since each line repeats them.
+                counts["commits"] += _commits_in(message)
+
                 msg_id = message.get("id")
                 if not msg_id or msg_id in seen:
                     continue
@@ -403,6 +473,7 @@ def collect_tokens(state, from_scratch=False):
     if len(seen_order) > MSG_ID_WINDOW:
         seen_order = seen_order[-MSG_ID_WINDOW:]
     state["recent_msg_ids"] = seen_order
+    state["projects_seen"] = sorted(known_projects)
     return per_day
 
 
@@ -433,14 +504,19 @@ def ensure_active(state, species_id=None):
     return state["active"]
 
 
-def apply_xp(state, gained_xp):
-    """Add XP to the active Pokemon, evolve it, and catch it at level 100."""
+def apply_xp(state, gained_xp, cap_level=None):
+    """Add XP to the active Pokemon, evolve it, and catch it at level 100.
+
+    `cap_level` limits how far the XP may carry it, used by the backfill so
+    replayed history cannot hand the first Pokemon a free run to 100.
+    """
     active = ensure_active(state)
     curve = xp_curve(active["growth_rate"])
     events = []
 
     level_before = active["level"]
-    active["xp"] = min(active["xp"] + gained_xp, curve[MAX_LEVEL])
+    ceiling = curve[cap_level] if cap_level else curve[MAX_LEVEL]
+    active["xp"] = min(active["xp"] + gained_xp, ceiling)
     active["level"] = level_from_xp(active["xp"], curve)
 
     if active["level"] > level_before:
@@ -506,6 +582,7 @@ def apply_xp(state, gained_xp):
                 "species_id": active["species_id"],
                 "name": active["name"],
                 "level": MAX_LEVEL,
+                "source": "trained",
                 "completed_at": active["completed_at"],
             })
         events.append({"type": "caught", "who": active["name"],
@@ -574,6 +651,9 @@ def update_display(state):
         "emoji": TYPE_EMOJI.get(types[0], "✨") if types else "✨",
         "today_xp": state["daily"].get(today, 0),
         "caught": len(state["pokedex"]),
+        "commits": state["totals"].get("commits", 0),
+        # Rewards from new projects, waiting for a species to be picked.
+        "unclaimed": state.get("unclaimed", 0),
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
         # Set when the Pokemon has reached a branching stage and is waiting for
@@ -652,12 +732,41 @@ def candidates(state):
 def scan(from_scratch=False):
     state = load_state()
     if from_scratch:
+        # A backfill recomputes XP from zero, but the species being raised, the
+        # branch choices and the Pokedex are the trainer's, not derived data —
+        # wiping them would silently swap their Pokemon back to the default.
+        previous = state.get("active") or {}
+        keep_species = previous.get("base_species_id")
+        keep_choices = previous.get("choices", {})
+        keep_pokedex = state.get("pokedex", [])
+        keep_unclaimed = state.get("unclaimed", 0)
+
         state = empty_state()
+        state["pokedex"] = keep_pokedex
+        state["unclaimed"] = keep_unclaimed
+        if keep_species:
+            ensure_active(state, species_id=keep_species)
+            state["active"]["choices"] = keep_choices
 
     per_day = collect_tokens(state, from_scratch=from_scratch)
     new_work = sum(per_day.values())
+    counts = state.pop("_last_counts", {"commits": 0, "new_projects": 0})
 
-    if new_work == 0:
+    # A backfill replays the whole history, so its commits and projects are not
+    # news: record them as the baseline instead of paying them out. Otherwise
+    # the first scan would hand over years of rewards at once, the same problem
+    # the level ceiling below exists to prevent.
+    if from_scratch:
+        state["totals"]["commits"] = counts["commits"]
+        counts = {"commits": 0, "new_projects": 0}
+    else:
+        state["totals"]["commits"] = state["totals"].get("commits", 0) + counts["commits"]
+        if PROJECT_GRANTS_POKEMON and counts["new_projects"]:
+            state["unclaimed"] = state.get("unclaimed", 0) + counts["new_projects"]
+
+    commit_xp = counts["commits"] * COMMIT_XP
+
+    if new_work == 0 and commit_xp == 0:
         # Even with no new tokens the display must refresh: the day rolls over
         # (today_xp resets) and sprites may still be missing.
         ensure_active(state)
@@ -668,11 +777,11 @@ def scan(from_scratch=False):
     for date, tokens in per_day.items():
         state["daily"][date] = state["daily"].get(date, 0) + tokens // TOKENS_PER_XP
 
-    gained_xp = new_work // TOKENS_PER_XP
+    gained_xp = new_work // TOKENS_PER_XP + commit_xp
     state["totals"]["work_tokens"] += new_work
     state["totals"]["xp_all_time"] += gained_xp
 
-    events = apply_xp(state, gained_xp)
+    events = apply_xp(state, gained_xp, cap_level=BACKFILL_MAX_LEVEL if from_scratch else None)
     update_display(state)
     # Notifications are posted by the menu bar app, not here. Going through
     # osascript attributes them to Script Editor, which on this machine has its
@@ -715,6 +824,33 @@ def main():
         state["candidates"] = candidates(state)
         save_state(state)
         print(f"{len(state['candidates'])} available")
+
+    elif command == "claim":
+        # Spends a reward earned by starting a new project. The Pokemon goes
+        # straight into the Pokedex marked as awarded, so it never passes for
+        # one that was actually raised to 100.
+        state = load_state()
+        if state.get("unclaimed", 0) <= 0:
+            print("Nothing to claim.")
+            return 1
+
+        species_id = int(sys.argv[2])
+        base = evolution_line(species_id)[0]
+        if any(p["species_id"] == base["species_id"] for p in state["pokedex"]):
+            print(f"{base['name'].capitalize()} is already in the Pokedex.")
+            return 1
+
+        state["pokedex"].append({
+            "species_id": base["species_id"],
+            "name": base["name"],
+            "level": 1,
+            "source": "project",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        state["unclaimed"] -= 1
+        update_display(state)
+        save_state(state)
+        print(f"Claimed {base['name']}. {state['unclaimed']} left.")
 
     elif command == "evolve":
         # Resolves a branching stage: the trainer names the form to become.
