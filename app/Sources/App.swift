@@ -4,6 +4,24 @@ import UserNotifications
 
 // MARK: - State model (mirrors ~/.claude/pokemon-state.json written by the engine)
 
+struct EvolutionOption: Decodable, Identifiable {
+    var species_id: Int
+    var name: String
+    var sprites: [String: String]?
+    var id: Int { species_id }
+
+    /// Branches past gen 5 have no animated sprite, so artwork stands in.
+    var spritePath: String? {
+        sprites?["animated"] ?? sprites?["artwork"]
+    }
+}
+
+struct PendingEvolution: Decodable {
+    var stage: Int
+    var level: Int
+    var options: [EvolutionOption]
+}
+
 struct Display: Decodable {
     var name: String
     var level: Int
@@ -18,6 +36,7 @@ struct Display: Decodable {
     var next_evo_level: Int?
     var sprites: [String: String]
     var cry: String?
+    var pending_evolution: PendingEvolution?
 }
 
 struct PokedexEntry: Decodable, Identifiable {
@@ -101,7 +120,7 @@ struct AnimatedSprite: NSViewRepresentable {
 // MARK: - Engine bridge
 
 enum PanelRoute {
-    case active, pokedex, picker
+    case active, pokedex, picker, evolution
 }
 
 @MainActor
@@ -215,6 +234,17 @@ final class Trainer: ObservableObject {
         try? process.run()
     }
 
+    /// Resolves a branching evolution once the trainer picks a form.
+    func evolve(into speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["evolve", String(speciesID)])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
     func loadCandidates() {
         guard !isLoadingCandidates else { return }
         isLoadingCandidates = true
@@ -283,6 +313,7 @@ struct TrainerPanel: View {
             case .active: activeView
             case .pokedex: pokedexView
             case .picker: pickerView
+            case .evolution: evolutionView
             }
         }
         .frame(width: 280)
@@ -325,7 +356,19 @@ struct TrainerPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let evo = display.next_evo, let level = display.next_evo_level {
+            // A branching chain stops here until a form is picked, so this is
+            // the one thing the panel must surface above everything else.
+            if let pending = display.pending_evolution {
+                Button {
+                    route = .evolution
+                } label: {
+                    Label("¡Listo para evolucionar! Elige entre \(pending.options.count)",
+                          systemImage: "sparkles")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 8)
+            } else if let evo = display.next_evo, let level = display.next_evo_level {
                 Text("Evoluciona a \(evo.capitalized) en Lv.\(level)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -421,6 +464,50 @@ struct TrainerPanel: View {
             Button("‹ Volver") { route = .active }
                 .buttonStyle(.borderless)
                 .font(.caption)
+        }
+    }
+
+    @ViewBuilder
+    private var evolutionView: some View {
+        if let pending = trainer.state.display?.pending_evolution {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Elige su evolución").font(.headline)
+                Text("Alcanzó el nivel \(pending.level). Esta decisión es definitiva.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                ScrollView {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
+                        ForEach(pending.options) { option in
+                            Button {
+                                trainer.evolve(into: option.species_id)
+                                route = .active
+                            } label: {
+                                VStack(spacing: 2) {
+                                    if let image = Sprites.image(option.spritePath) {
+                                        Image(nsImage: image)
+                                            .resizable().interpolation(.none)
+                                            .scaledToFit().frame(height: 34)
+                                    } else {
+                                        Color.clear.frame(height: 34)
+                                    }
+                                    Text(option.name.capitalized)
+                                        .font(.system(size: 8)).lineLimit(1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 200)
+
+                Button("‹ Decidir después") { route = .active }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+            }
+        } else {
+            // The choice was resolved elsewhere (CLI, or another click).
+            Color.clear.frame(height: 1).onAppear { route = .active }
         }
     }
 

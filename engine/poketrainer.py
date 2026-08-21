@@ -37,9 +37,14 @@ SPRITES_DIR = ASSETS_DIR / "sprites"
 # therefore 2.46x too slow, stretching a single Pokemon to ~15 weeks.
 TOKENS_PER_XP = 50
 
-# Synthetic levels for evolutions that are not level-based (stones, trade,
-# friendship). Without this, Eevee and Pikachu would never evolve.
-SYNTHETIC_EVO_LEVEL = {1: 16, 2: 36}
+# Level assigned to evolutions that PokeAPI reports without one — stones, trade
+# and friendship all come back as min_level: null, so without this Eevee,
+# Pikachu and Kadabra would never evolve at all.
+#
+# Chains with several such hops (Pichu -> Pikachu -> Raichu) cannot all land on
+# the same level, so they are spread evenly and the last one lands here: one hop
+# gives 40, two give 20 and 40.
+FIXED_EVO_LEVEL = 40
 
 MAX_LEVEL = 100
 
@@ -139,37 +144,58 @@ def _id_from_url(url):
 
 
 def evolution_line(species_id):
-    """Flatten the evolution chain into a linear list with each hop's level.
+    """Flatten the evolution chain into stages, each with its level and options.
 
-    For branching chains (Eevee) the first branch is taken; the alternatives are
-    kept under 'branches' so the UI can offer them later.
+    A stage keeps every branch it offers, so a chain like Eevee's presents all
+    eight forms and the trainer picks one. Stages with a single option evolve on
+    their own.
+
+    Note: for a branching chain only the first branch's continuation is walked.
+    Every branching gen-1 chain ends at the branch, so nothing is lost today.
     """
     species = get_species(species_id)
     chain_id = _id_from_url(species["evolution_chain"]["url"])
     chain = get_evolution_chain(chain_id)["chain"]
 
+    hops = []
+    node = chain
+    while node["evolves_to"]:
+        options = node["evolves_to"]
+        details = options[0]["evolution_details"][0] if options[0]["evolution_details"] else {}
+        hops.append({
+            "raw_level": details.get("min_level"),
+            "options": [{"species_id": _id_from_url(o["species"]["url"]),
+                         "name": o["species"]["name"]} for o in options],
+        })
+        node = options[0]
+
+    # Hops PokeAPI gives no level for are spread evenly, ending at the fixed
+    # level: Kadabra -> Alakazam (trade) becomes 40, while Pichu's two levelless
+    # hops become 20 and 40.
+    levelless = [i for i, hop in enumerate(hops) if hop["raw_level"] is None]
+    for position, index in enumerate(levelless, start=1):
+        hops[index]["raw_level"] = round(FIXED_EVO_LEVEL * position / len(levelless))
+
+    # Levels must strictly increase, or a synthetic level could land on or below
+    # a real one earlier in the chain and make a stage unreachable.
+    previous = 0
+    for hop in hops:
+        hop["min_level"] = max(hop["raw_level"], previous + 1)
+        previous = hop["min_level"]
+
     stages = [{"species_id": _id_from_url(chain["species"]["url"]),
                "name": chain["species"]["name"],
                "min_level": None,
-               "branches": []}]
-
-    node = chain
-    stage = 1
-    while node["evolves_to"]:
-        options = node["evolves_to"]
-        chosen = options[0]
-        details = chosen["evolution_details"][0] if chosen["evolution_details"] else {}
-        level = details.get("min_level") or SYNTHETIC_EVO_LEVEL.get(stage, 36)
+               "options": []}]
+    for hop in hops:
         stages.append({
-            "species_id": _id_from_url(chosen["species"]["url"]),
-            "name": chosen["species"]["name"],
-            "min_level": level,
-            "branches": [{"species_id": _id_from_url(o["species"]["url"]),
-                          "name": o["species"]["name"]} for o in options],
+            # The first option is only a placeholder label for the stage; a
+            # multi-option stage never evolves without an explicit choice.
+            "species_id": hop["options"][0]["species_id"],
+            "name": hop["options"][0]["name"],
+            "min_level": hop["min_level"],
+            "options": hop["options"],
         })
-        node = chosen
-        stage += 1
-
     return stages
 
 
@@ -425,11 +451,36 @@ def apply_xp(state, gained_xp):
                        "from_level": level_before, "to_level": active["level"],
                        "at": datetime.now(timezone.utc).isoformat()})
 
-    # Evolution: the most advanced stage whose level has already been reached.
+    # State written before branch support has stages without "options"; rebuild
+    # the line rather than crashing on it.
+    if any("options" not in stage for stage in active["line"]):
+        active["line"] = evolution_line(active["base_species_id"])
+
+    # Walk forward through the stages whose level has been reached. A stage with
+    # several options stops the walk until the trainer picks one, so an Eevee is
+    # never silently turned into whichever branch happened to come first.
+    choices = active.setdefault("choices", {})
+    active["pending_evolution"] = None
     target = active["line"][0]
-    for stage in active["line"]:
-        if stage["min_level"] is None or active["level"] >= stage["min_level"]:
-            target = stage
+
+    for index, stage in enumerate(active["line"]):
+        if index == 0:
+            continue
+        if active["level"] < stage["min_level"]:
+            break
+        if len(stage["options"]) > 1:
+            chosen = choices.get(str(index))
+            if chosen is None:
+                active["pending_evolution"] = {
+                    "stage": index,
+                    "level": stage["min_level"],
+                    "options": stage["options"],
+                }
+                break
+            target = next(o for o in stage["options"] if o["species_id"] == chosen)
+        else:
+            target = stage["options"][0]
+
     if target["species_id"] != active["species_id"]:
         events.append({"type": "evolution", "from": active["name"], "to": target["name"],
                        "species_id": target["species_id"],
@@ -463,6 +514,24 @@ def apply_xp(state, gained_xp):
 
     state["events"] = (state.get("events", []) + events)[-50:]
     return events
+
+
+def _with_option_sprites(pending):
+    """Fetches sprites for a pending branch so the picker can render them.
+
+    Eevee's branches reach well past gen 1 (Sylveon is 700), so these are not
+    among the sprites already downloaded for the candidate grid.
+    """
+    if not pending:
+        return None
+    for option in pending["options"]:
+        sprites = ensure_sprites(option["species_id"], kinds=("animated",))
+        # Gen-5 animated sprites only cover species up to 649, so later branches
+        # such as Sylveon (700) have none. Fall back to the official artwork.
+        if not sprites.get("animated"):
+            sprites = ensure_sprites(option["species_id"], kinds=("artwork",))
+        option["sprites"] = sprites
+    return pending
 
 
 def update_display(state):
@@ -507,6 +576,9 @@ def update_display(state):
         "caught": len(state["pokedex"]),
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
+        # Set when the Pokemon has reached a branching stage and is waiting for
+        # the trainer to pick a form. The panel renders the options.
+        "pending_evolution": _with_option_sprites(active.get("pending_evolution")),
         "sprites": ensure_sprites(active["species_id"]),
         # Cached here so the menu bar app can play it on open without paying
         # the cost of spawning Python.
@@ -643,6 +715,30 @@ def main():
         state["candidates"] = candidates(state)
         save_state(state)
         print(f"{len(state['candidates'])} available")
+
+    elif command == "evolve":
+        # Resolves a branching stage: the trainer names the form to become.
+        state = load_state()
+        active = state.get("active")
+        pending = (active or {}).get("pending_evolution")
+        if not pending:
+            print("No evolution is waiting for a choice.")
+            return 1
+
+        wanted = int(sys.argv[2])
+        valid = {o["species_id"] for o in pending["options"]}
+        if wanted not in valid:
+            names = ", ".join(f"{o['name']} ({o['species_id']})" for o in pending["options"])
+            print(f"{wanted} is not one of the options. Choose from: {names}")
+            return 1
+
+        active.setdefault("choices", {})[str(pending["stage"])] = wanted
+        events = apply_xp(state, 0)
+        update_display(state)
+        save_state(state)
+        print(f"Now: {state['active']['name']} Lv.{state['active']['level']}")
+        for event in events:
+            print(f"  {event['type']}")
 
     elif command == "test-notification":
         # Appends a synthetic event so the menu bar app posts a real banner
