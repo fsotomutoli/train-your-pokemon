@@ -644,6 +644,23 @@ def main():
         save_state(state)
         print(f"{len(state['candidates'])} available")
 
+    elif command == "test-notification":
+        # Appends a synthetic event so the menu bar app posts a real banner
+        # through its own bundle id. Useful to confirm macOS is showing them
+        # without waiting for an actual evolution.
+        state = load_state()
+        active = state.get("active") or {}
+        state.setdefault("events", []).append({
+            "type": "evolution",
+            "from": active.get("name", "charmeleon"),
+            "to": active.get("name", "charizard"),
+            "species_id": active.get("species_id", 6),
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        state["events"] = state["events"][-50:]
+        save_state(state)
+        print("Test event queued. Open the menu bar panel, or wait up to 30s.")
+
     elif command == "cry":
         active = load_state().get("active")
         if active:

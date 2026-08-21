@@ -287,7 +287,13 @@ struct TrainerPanel: View {
         }
         .frame(width: 280)
         .padding(14)
-        .onAppear { trainer.playCry() }
+        .onAppear {
+            // Re-read on open so the panel never shows stale numbers, and so a
+            // pending milestone is announced right away instead of waiting out
+            // the 30s timer.
+            trainer.load()
+            trainer.playCry()
+        }
     }
 
     @ViewBuilder
