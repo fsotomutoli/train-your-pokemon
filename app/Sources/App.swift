@@ -30,78 +30,6 @@ struct TrainerState: Codable {
     var pokedex: [PokedexEntry] = []
 }
 
-// MARK: - Sprite loading
-
-enum Sprites {
-    // --- Menu bar icon geometry (tune these two to reposition the sprite) ---
-
-    /// Total height of the icon box. The menu bar clips anything taller than
-    /// itself, so this is the ceiling — going higher does not enlarge the
-    /// sprite, it just crops it.
-    static let canvasHeight: CGFloat = 24
-
-    /// Transparent space left above the sprite inside the box. Because the bar
-    /// centers the icon, padding the top is what visually pushes the sprite
-    /// down. Raise it to lower the sprite, lower it to raise the sprite.
-    static let topInset: CGFloat = 3
-
-    /// Static first frame, trimmed and scaled for the menu bar icon.
-    ///
-    /// Gen-5 sprites carry transparent padding around the character, so drawing
-    /// them raw wastes most of the available height. Trimming to the alpha
-    /// bounding box first makes the sprite visually fill the bar.
-    static func firstFrame(_ path: String,
-                           canvas: CGFloat = canvasHeight,
-                           inset: CGFloat = topInset) -> NSImage? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let rep = NSBitmapImageRep(data: data) else { return nil }
-        rep.setProperty(.currentFrame, withValue: 0)
-
-        let box = alphaBounds(rep) ?? NSRect(x: 0, y: 0, width: rep.pixelsWide, height: rep.pixelsHigh)
-        let spriteHeight = canvas - inset
-        let scale = spriteHeight / box.height
-        let spriteWidth = (box.width * scale).rounded()
-
-        let image = NSImage(size: NSSize(width: spriteWidth, height: canvas))
-        image.lockFocus()
-        // Nearest-neighbour keeps the hard edges of pixel art from turning to mush.
-        NSGraphicsContext.current?.imageInterpolation = .none
-        // Drawn at y = 0 (bottom of the box) so the empty inset lands on top.
-        rep.draw(in: NSRect(x: 0, y: 0, width: spriteWidth, height: spriteHeight),
-                 from: box,
-                 operation: .sourceOver,
-                 fraction: 1.0,
-                 respectFlipped: true,
-                 hints: [.interpolation: NSImageInterpolation.none.rawValue])
-        image.unlockFocus()
-        return image
-    }
-
-    /// Tight bounding box of pixels that are not effectively transparent.
-    private static func alphaBounds(_ rep: NSBitmapImageRep) -> NSRect? {
-        var minX = rep.pixelsWide, minY = rep.pixelsHigh, maxX = -1, maxY = -1
-        for y in 0..<rep.pixelsHigh {
-            for x in 0..<rep.pixelsWide {
-                guard let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.06 else { continue }
-                minX = min(minX, x); maxX = max(maxX, x)
-                minY = min(minY, y); maxY = max(maxY, y)
-            }
-        }
-        guard maxX >= minX, maxY >= minY else { return nil }
-        return NSRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
-    }
-
-    static func image(_ path: String?) -> NSImage? {
-        guard let path, FileManager.default.fileExists(atPath: path) else { return nil }
-        return NSImage(contentsOfFile: path)
-    }
-
-    /// Sprite path for any species, for the Pokedex grid.
-    static func spritePath(speciesID: Int) -> String {
-        "\(Config.repoPath)/assets/sprites/\(speciesID)-animated.gif"
-    }
-}
-
 /// NSImageView animates GIFs natively; SwiftUI's Image renders only one frame.
 /// Used only inside the panel, which is open for a few seconds at a time.
 struct AnimatedSprite: NSViewRepresentable {
@@ -345,7 +273,7 @@ struct TrainYourPokemonApp: App {
             // would mean ~36,000 redraws per hour on a CPU without efficiency
             // cores. The panel animates instead.
             if let path = trainer.state.display?.sprites["animated"],
-               let image = Sprites.firstFrame(path) {
+               let image = Sprites.menuBarIcon(path) {
                 // The NSImage already carries the right point size, so it must
                 // NOT be made resizable here: that lets the bar stretch it past
                 // its own height and clip the sprite.

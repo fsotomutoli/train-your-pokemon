@@ -21,9 +21,10 @@ enum Config {
 EOF
 
 echo "Compiling…"
+# Every file under Sources/, so adding one does not need a change here.
 swiftc -parse-as-library -O \
     -o "$BUNDLE/Contents/MacOS/TrainYourPokemon" \
-    "$APP_DIR/Sources/App.swift" \
+    "$APP_DIR"/Sources/*.swift \
     "$BUILD_DIR/Config.swift"
 
 cat > "$BUNDLE/Contents/Info.plist" <<'EOF'
