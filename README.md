@@ -4,7 +4,7 @@ Turns your Claude Code token usage into a Pokémon that levels up and evolves,
 shown in the macOS menu bar and in the Claude Code status line. Reach level 100
 and it joins your Pokédex, so you can start raising the next one.
 
-<img src="docs/img/menubar.png" alt="Charizard at level 82 in the macOS menu bar" width="95">
+<img src="docs/img/panel.png" alt="Charizard at level 82 in the macOS menu bar, with the panel open showing its type, XP bar and Pokedex button" width="330">
 
 ```
 statusline  🌿 main  |  🤖 Opus 5 [high]  |  🔥 Charizard Lv.82 [████████░░] 84%
