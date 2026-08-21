@@ -36,6 +36,7 @@ struct Display: Decodable {
     var unclaimed: Int?
     var can_retire: Bool?
     var retire_level: Int?
+    var shiny: Bool?
     var next_evo: String?
     var next_evo_level: Int?
     var sprites: [String: String]
@@ -49,14 +50,16 @@ struct PokedexEntry: Decodable, Identifiable {
     var level: Int
     var source: String?
     var maxed: Bool?
+    var shiny: Bool?
     var id: Int { species_id }
 
     /// Distinguishes what was awarded, what was retired early, and what was
     /// pushed all the way to 100 — the pace is the trainer's choice, so the
     /// Pokedex has to show which choice each entry represents.
     var badge: String {
-        if source == "project" { return "Obtenido" }
-        return maxed == true ? "★ Lv.100" : "Lv.\(level)"
+        let mark = shiny == true ? "✨" : ""
+        if source == "project" { return mark + "Obtenido" }
+        return mark + (maxed == true ? "★ Lv.100" : "Lv.\(level)")
     }
 }
 
@@ -382,8 +385,11 @@ struct TrainerPanel: View {
                     .help("Clic para escuchar su grito")
             }
 
-            Text(display.name.capitalized)
+            Text(display.shiny == true
+                 ? "✨ \(display.name.capitalized) ✨"
+                 : display.name.capitalized)
                 .font(.title2.bold())
+                .foregroundStyle(display.shiny == true ? .yellow : .primary)
             Text("\(display.emoji) \(display.types.map(\.capitalized).joined(separator: " / "))")
                 .font(.caption)
                 .foregroundStyle(.secondary)

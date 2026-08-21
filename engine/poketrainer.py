@@ -13,6 +13,7 @@ Usage:
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -58,6 +59,16 @@ MAX_LEVEL = 100
 # in an afternoon, which is the clutter problem all over again. Level 50 is about
 # two active days: enough that an entry means something.
 MIN_RETIRE_LEVEL = 50
+
+# Odds of a new Pokemon being shiny, as one in N. Rolled once when a species
+# starts being trained or is claimed, never on evolution: shininess is inherited,
+# so a shiny Charmander yields a shiny Charizard.
+#
+# The games use 1/8192, which at this cadence means never. At roughly forty
+# encounters a year — the pace of retiring around level 60 — one in ten lands
+# near four a year. Retiring later means fewer encounters and fewer shinies,
+# which is the intended trade: hunting them costs Pokedex quality.
+SHINY_CHANCE = 10
 
 # Ceiling for XP granted by a backfill. Replaying a long history otherwise hands
 # the very first Pokemon a nearly free run to 100, which makes every later one
@@ -231,22 +242,27 @@ def evolution_line(species_id):
     return stages
 
 
-def ensure_sprites(species_id, kinds=("animated", "artwork")):
+def ensure_sprites(species_id, kinds=("animated", "artwork"), shiny=False):
     """Download the requested sprites once. Returns paths.
 
     `kinds` exists so bulk callers can skip the official artwork: it is ~150KB
     per species against ~20KB for the animated sprite, and the candidate grid
     only ever renders the small one.
+
+    Shiny variants live under a `shiny/` segment and are cached separately, so a
+    shiny Pokemon never overwrites the ordinary sprite of the same species.
     """
     SPRITES_DIR.mkdir(parents=True, exist_ok=True)
+    variant = "shiny/" if shiny else ""
+    suffix = "-shiny" if shiny else ""
     paths = {}
     for key, url, ext in (
-        ("animated", f"{SPRITE_BASE}/versions/generation-v/black-white/animated/{species_id}.gif", "gif"),
-        ("artwork", f"{SPRITE_BASE}/other/official-artwork/{species_id}.png", "png"),
+        ("animated", f"{SPRITE_BASE}/versions/generation-v/black-white/animated/{variant}{species_id}.gif", "gif"),
+        ("artwork", f"{SPRITE_BASE}/other/official-artwork/{variant}{species_id}.png", "png"),
     ):
         if key not in kinds:
             continue
-        target = SPRITES_DIR / f"{species_id}-{key}.{ext}"
+        target = SPRITES_DIR / f"{species_id}-{key}{suffix}.{ext}"
         if not target.exists():
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "train-your-pokemon/1.0"})
@@ -508,6 +524,9 @@ def ensure_active(state, species_id=None):
         "growth_rate": species["growth_rate"]["name"],
         "xp": 0,
         "level": 1,
+        # Rolled once, here. Shininess is inherited through the chain, so it is
+        # never re-rolled on evolution.
+        "shiny": random.randrange(SHINY_CHANCE) == 0,
         "line": line,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -593,6 +612,8 @@ def apply_xp(state, gained_xp, cap_level=None):
                 "name": active["name"],
                 "level": MAX_LEVEL,
                 "source": "trained",
+                "maxed": True,
+                "shiny": bool(active.get("shiny")),
                 "completed_at": active["completed_at"],
             })
         events.append({"type": "caught", "who": active["name"],
@@ -673,7 +694,8 @@ def update_display(state):
         # Set when the Pokemon has reached a branching stage and is waiting for
         # the trainer to pick a form. The panel renders the options.
         "pending_evolution": _with_option_sprites(active.get("pending_evolution")),
-        "sprites": ensure_sprites(active["species_id"]),
+        "shiny": bool(active.get("shiny")),
+        "sprites": ensure_sprites(active["species_id"], shiny=bool(active.get("shiny"))),
         # Cached here so the menu bar app can play it on open without paying
         # the cost of spawning Python.
         "cry": ensure_cry(active["species_id"]),
@@ -864,6 +886,7 @@ def main():
                 "level": active["level"],
                 "source": "trained",
                 "maxed": active["level"] >= MAX_LEVEL,
+                "shiny": bool(active.get("shiny")),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })
         retired = f"{active['name']} Lv.{active['level']}"
@@ -893,6 +916,7 @@ def main():
             "name": base["name"],
             "level": 1,
             "source": "project",
+            "shiny": random.randrange(SHINY_CHANCE) == 0,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         })
         state["unclaimed"] -= 1
