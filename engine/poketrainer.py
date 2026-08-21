@@ -13,6 +13,7 @@ Usage:
 
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -172,14 +173,21 @@ def evolution_line(species_id):
     return stages
 
 
-def ensure_sprites(species_id):
-    """Download the animated GIF and official artwork once. Returns paths."""
+def ensure_sprites(species_id, kinds=("animated", "artwork")):
+    """Download the requested sprites once. Returns paths.
+
+    `kinds` exists so bulk callers can skip the official artwork: it is ~150KB
+    per species against ~20KB for the animated sprite, and the candidate grid
+    only ever renders the small one.
+    """
     SPRITES_DIR.mkdir(parents=True, exist_ok=True)
     paths = {}
     for key, url, ext in (
         ("animated", f"{SPRITE_BASE}/versions/generation-v/black-white/animated/{species_id}.gif", "gif"),
         ("artwork", f"{SPRITE_BASE}/other/official-artwork/{species_id}.png", "png"),
     ):
+        if key not in kinds:
+            continue
         target = SPRITES_DIR / f"{species_id}-{key}.{ext}"
         if not target.exists():
             try:
@@ -191,6 +199,98 @@ def ensure_sprites(species_id):
         if target.exists():
             paths[key] = str(target)
     return paths
+
+
+CRIES_DIR = ASSETS_DIR / "cries"
+
+# PokeAPI ships two cry sets. "legacy" are the classic 8-bit cries from the
+# original games, which is what most people recognise; "latest" are the
+# re-recorded ones from the Sword/Shield era and sound noticeably different.
+CRY_VERSION = "legacy"
+
+
+def ensure_cry(species_id, version=CRY_VERSION):
+    """Download the Pokemon's cry once. Returns the path, or None.
+
+    PokeAPI serves cries as Ogg Vorbis. macOS CoreAudio decodes that natively
+    (afinfo reports type 'Oggf', codec 'vorb'), so afplay works with no
+    conversion step and no extra dependency.
+    """
+    CRIES_DIR.mkdir(parents=True, exist_ok=True)
+    target = CRIES_DIR / f"{species_id}-{version}.ogg"
+    if target.exists():
+        return str(target)
+    try:
+        url = get_pokemon(species_id)["cries"][version]
+        req = urllib.request.Request(url, headers={"User-Agent": "train-your-pokemon/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            target.write_bytes(resp.read())
+        return str(target)
+    except Exception:
+        return None  # a missing cry must never break progression
+
+
+def notify(title, subtitle, message, species_id=None):
+    """Post a macOS notification and play the Pokemon's cry.
+
+    osascript is used rather than UNUserNotificationCenter because this app is
+    ad-hoc signed and has no notification entitlement. The cry is played
+    detached so a 1.5s sound never delays a scan.
+    """
+    script = (f'display notification {json.dumps(message)} '
+              f'with title {json.dumps(title)} '
+              f'subtitle {json.dumps(subtitle)}')
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    if species_id is not None:
+        cry = ensure_cry(species_id)
+        if cry:
+            try:
+                subprocess.Popen(["afplay", cry],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+
+def announce(state, events):
+    """Turn progression events into notifications, without ever repeating one."""
+    seen = state.setdefault("notified", {})
+    for event in events:
+        if event["type"] == "pre_evolution":
+            key = f"pre-evo-{event['to']}-{event['at_level']}"
+            if key in seen:
+                continue
+            seen[key] = event["at"]
+            notify("Train Your Pokemon",
+                   f"{event['from'].capitalize()} Lv.{event['at_level']}",
+                   f"Está a punto de evolucionar a {event['to'].capitalize()} "
+                   f"en el nivel {event['level']}.")
+
+        elif event["type"] == "evolution":
+            key = f"evo-{event['to']}"
+            if key in seen:
+                continue
+            seen[key] = event["at"]
+            notify("¡Evolución!",
+                   f"{event['from'].capitalize()} → {event['to'].capitalize()}",
+                   f"Tu {event['from'].capitalize()} evolucionó a "
+                   f"{event['to'].capitalize()}.",
+                   species_id=event.get("species_id"))
+
+        elif event["type"] == "caught":
+            key = f"caught-{event['who']}"
+            if key in seen:
+                continue
+            seen[key] = event["at"]
+            notify("¡Nivel 100!",
+                   event["who"].capitalize(),
+                   f"{event['who'].capitalize()} llegó al máximo y entró a tu "
+                   f"Pokédex. Ya puedes entrenar a otro.",
+                   species_id=event.get("species_id"))
 
 
 def level_from_xp(xp, curve):
@@ -318,7 +418,11 @@ def apply_xp(state, gained_xp):
     active["level"] = level_from_xp(active["xp"], curve)
 
     if active["level"] > level_before:
-        events.append({"type": "level_up", "from": level_before, "to": active["level"],
+        # Distinct key names on purpose: `from`/`to` carry species names on
+        # evolution events, and reusing them for integers here made the whole
+        # event list fail to decode in the Swift app, blanking the menu bar.
+        events.append({"type": "level_up",
+                       "from_level": level_before, "to_level": active["level"],
                        "at": datetime.now(timezone.utc).isoformat()})
 
     # Evolution: the most advanced stage whose level has already been reached.
@@ -328,9 +432,19 @@ def apply_xp(state, gained_xp):
             target = stage
     if target["species_id"] != active["species_id"]:
         events.append({"type": "evolution", "from": active["name"], "to": target["name"],
+                       "species_id": target["species_id"],
                        "at": datetime.now(timezone.utc).isoformat()})
         active["species_id"] = target["species_id"]
         active["name"] = target["name"]
+
+    # Heads-up one level before evolving, so the change is not a surprise.
+    upcoming = next((s for s in active["line"]
+                     if s["min_level"] and s["min_level"] > active["level"]), None)
+    if upcoming and active["level"] >= upcoming["min_level"] - 1:
+        events.append({"type": "pre_evolution", "from": active["name"],
+                       "to": upcoming["name"], "level": upcoming["min_level"],
+                       "at_level": active["level"],
+                       "at": datetime.now(timezone.utc).isoformat()})
 
     # Level 100: goes into the Pokedex and becomes swappable.
     if active["level"] >= MAX_LEVEL and not active.get("completed_at"):
@@ -343,7 +457,9 @@ def apply_xp(state, gained_xp):
                 "level": MAX_LEVEL,
                 "completed_at": active["completed_at"],
             })
-        events.append({"type": "caught", "who": active["name"], "at": active["completed_at"]})
+        events.append({"type": "caught", "who": active["name"],
+                       "species_id": active["species_id"],
+                       "at": active["completed_at"]})
 
     state["events"] = (state.get("events", []) + events)[-50:]
     return events
@@ -392,6 +508,9 @@ def update_display(state):
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
         "sprites": ensure_sprites(active["species_id"]),
+        # Cached here so the menu bar app can play it on open without paying
+        # the cost of spawning Python.
+        "cry": ensure_cry(active["species_id"]),
     }
 
     # Flat line for the statusline, read with bash's `read` builtin so no
@@ -402,6 +521,60 @@ def update_display(state):
     tmp = STATUSLINE_PATH.with_suffix(".tmp")
     tmp.write_text("\t".join(fields) + "\n", encoding="utf-8")
     os.replace(tmp, STATUSLINE_PATH)
+
+
+GEN1_MAX = 151
+CANDIDATES_PATH = CACHE_DIR / "candidates.json"
+
+
+def base_forms():
+    """Base-form species of generation 1, i.e. the starting point of each chain.
+
+    Derived from evolution chains rather than by testing every species, because
+    a chain names its base directly. The result is cached to a single file: the
+    walk costs ~80 requests and only needs doing once.
+    """
+    if CANDIDATES_PATH.exists():
+        with open(CANDIDATES_PATH) as fh:
+            return json.load(fh)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    listing = _get_json(f"{POKEAPI}/evolution-chain?limit=80", "chain-list")
+
+    forms = []
+    for entry in listing["results"]:
+        chain_id = _id_from_url(entry["url"])
+        try:
+            chain = get_evolution_chain(chain_id)["chain"]
+        except Exception:
+            continue
+        species_id = _id_from_url(chain["species"]["url"])
+        if species_id <= GEN1_MAX:
+            forms.append({"species_id": species_id, "name": chain["species"]["name"]})
+
+    forms.sort(key=lambda f: f["species_id"])
+    with open(CANDIDATES_PATH, "w") as fh:
+        json.dump(forms, fh)
+    return forms
+
+
+def candidates(state):
+    """Base forms the trainer has not completed yet, with sprites ready."""
+    caught = {p["species_id"] for p in state.get("pokedex", [])}
+    # A caught Pokemon is stored in its final form, so compare whole chains.
+    caught_bases = set()
+    for species_id in caught:
+        try:
+            caught_bases.add(evolution_line(species_id)[0]["species_id"])
+        except Exception:
+            continue
+
+    available = [f for f in base_forms() if f["species_id"] not in caught_bases]
+    for form in available:
+        # Only the small sprite: the grid never shows the 475px artwork, and
+        # fetching both for ~70 species is what made the first run take 2min.
+        form["sprites"] = ensure_sprites(form["species_id"], kinds=("animated",))
+    return available
 
 
 def scan(from_scratch=False):
@@ -429,6 +602,11 @@ def scan(from_scratch=False):
 
     events = apply_xp(state, gained_xp)
     update_display(state)
+    # Notifications are posted by the menu bar app, not here. Going through
+    # osascript attributes them to Script Editor, which on this machine has its
+    # banner style set to none: the cry played but no banner ever appeared.
+    # The app posts them under its own bundle id via UNUserNotificationCenter,
+    # deduplicating against a timestamp watermark over `events`.
     state["last_scan"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
     return state, events
@@ -457,6 +635,22 @@ def main():
 
     elif command == "status":
         print(json.dumps(load_state(), indent=2, ensure_ascii=False))
+
+    elif command == "candidates":
+        # Written to the state file so the menu bar app reads it the same way
+        # it reads everything else, instead of parsing stdout.
+        state = load_state()
+        state["candidates"] = candidates(state)
+        save_state(state)
+        print(f"{len(state['candidates'])} available")
+
+    elif command == "cry":
+        active = load_state().get("active")
+        if active:
+            path = ensure_cry(active["species_id"])
+            if path:
+                subprocess.Popen(["afplay", path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     elif command == "choose":
         state = load_state()

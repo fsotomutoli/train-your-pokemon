@@ -4,6 +4,7 @@ progress.md
 # Downloaded artifacts: PokeAPI responses and sprites are fetched on demand
 assets/cache/
 assets/sprites/
+assets/cries/
 
 # Build output
 app/.build/
