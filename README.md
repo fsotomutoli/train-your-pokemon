@@ -1,8 +1,9 @@
 # Train Your Pokémon
 
-Turns your Claude Code token usage into a Pokémon that levels up and evolves,
-shown in the macOS menu bar and in the Claude Code status line. Reach level 100
-and it joins your Pokédex, so you can start raising the next one.
+Turns your Claude Code work into a Pokémon that levels up and evolves, shown in
+the macOS menu bar and in the Claude Code status line. Tokens and commits both
+earn XP; reach level 100 and it joins your Pokédex, so you can start raising the
+next one.
 
 <img src="docs/img/panel.png" alt="Charizard at level 82 in the macOS menu bar, with the panel open showing its type, XP bar and Pokedex button" width="330">
 
@@ -17,8 +18,8 @@ and evolution data come from [PokéAPI](https://pokeapi.co).
 ## How it works
 
 Claude Code writes a JSONL transcript per session under `~/.claude/projects/`.
-The engine reads those incrementally, converts token usage into XP, and writes a
-single state file that both frontends read.
+The engine reads those incrementally, turns token usage and commits into XP, and
+writes a single state file that both frontends read.
 
 ```
 ~/.claude/projects/*.jsonl
@@ -32,6 +33,28 @@ single state file that both frontends read.
                  (SwiftUI)                       status line
 ```
 
+## Earning XP
+
+Two sources feed the same Pokémon, split by how often each happens.
+
+| Source | Rate | Reward |
+|---|---|---|
+| Work tokens | continuous | 1 XP per 50 tokens |
+| Commits | ~9 a day | 2,000 XP each |
+| New project | a few a year | a Pokémon of your choice |
+
+Commits grant XP rather than Pokémon on purpose. At nine a day, awarding a
+Pokémon per commit would bury the Pokédex under level-1 entries nobody trained
+and drown the ones actually raised to 100 — the Pokédex has to stay a record of
+what was trained, so there is a single route into it.
+
+Starting a brand new project does grant one, because it happens rarely enough to
+stay meaningful. Those are stored with their source and shown as *Obtenido*
+rather than *Lv.100*, so an awarded Pokémon never passes for a trained one.
+
+Commits are counted from the transcript itself, not from git, so no repository
+needs a hook and every project counts automatically.
+
 ## The interesting parts
 
 **Not all tokens are work.** `cache_read` accounts for ~98% of raw token volume
@@ -44,8 +67,15 @@ and each line carries the full `usage` payload, so naive summing inflates totals
 by ~2.5x. Everything is deduplicated by `message.id`.
 
 **Not every evolution has a level.** PokéAPI returns `min_level: null` for
-evolutions triggered by stones, trade or friendship — without a fallback, Eevee
-and Pikachu would never evolve. Those get synthetic levels (16 and 36).
+evolutions triggered by stones, trade or friendship, so without a fallback Eevee,
+Pikachu and Kadabra would never evolve at all. Those land on level 40. Chains
+with several such hops cannot all sit there, so they are spread evenly ending at
+40: Pichu's two become 20 and 40.
+
+**Branching chains wait for you.** Eevee has eight forms, and evolving into
+whichever one PokéAPI happens to list first would make the choice an illusion.
+On reaching the level the engine stops and records the options; the panel shows
+them and picking one is what evolves it.
 
 **The status line runs several times per second.** It never invokes the engine;
 it reads a pre-rendered tab-separated line with bash's `read` builtin. An earlier
@@ -87,20 +117,30 @@ python3 engine/poketrainer.py status             # dump state as JSON
 python3 engine/poketrainer.py candidates         # list species you can train
 python3 engine/poketrainer.py choose 4           # switch species (level 100 only)
 python3 engine/poketrainer.py choose 4 --keep-xp # switch, carrying XP over
+python3 engine/poketrainer.py evolve 197         # pick a form on a branching stage
+python3 engine/poketrainer.py claim 25           # spend a new-project reward
 python3 engine/poketrainer.py cry                # play the current cry
 python3 engine/poketrainer.py test-notification  # queue a test banner
 ```
 
 ## Tuning
 
-XP pace lives in one constant in `engine/poketrainer.py`:
+Pace and rewards live at the top of `engine/poketrainer.py`:
 
 ```python
-TOKENS_PER_XP = 50   # lower = faster levelling
+TOKENS_PER_XP      = 50     # lower = faster levelling
+COMMIT_XP          = 2000   # XP per commit
+FIXED_EVO_LEVEL    = 40     # for evolutions PokeAPI gives no level
+BACKFILL_MAX_LEVEL = 60     # ceiling on XP granted by replaying history
 ```
 
-At 50, roughly 26 active days of heavy use reach level 100. Adjust to taste,
-then re-run `backfill`.
+At these values roughly 17 active days of heavy use reach level 100, and about a
+third of XP comes from commits rather than tokens. Adjust to taste, then re-run
+`backfill`.
+
+`BACKFILL_MAX_LEVEL` matters more than it looks. Without a ceiling, replaying a
+long history hands the very first Pokémon a nearly free run to 100 and makes
+every later one feel like a wall.
 
 Menu bar framing lives in `app/Sources/Sprites.swift`:
 
@@ -117,9 +157,11 @@ without screenshotting the menu bar.
 
 ## A caveat worth naming
 
-This rewards consumption. If it works, it nudges you toward burning tokens for
-the dopamine, which is not obviously a good thing. A daily XP cap would fix that
-and is deliberately not implemented — decide for yourself.
+Anything that rewards token usage nudges you toward burning tokens for the
+dopamine, which is not obviously a good thing. Paying for commits softens it —
+a commit is an outcome rather than spend, and at the default rates roughly a
+third of XP comes from work — but it does not remove it. A daily XP cap would,
+and is deliberately not implemented. Decide for yourself.
 
 ## License
 
