@@ -28,9 +28,13 @@ ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 CACHE_DIR = ASSETS_DIR / "cache"
 SPRITES_DIR = ASSETS_DIR / "sprites"
 
-# 100 work tokens = 1 XP. Calibrated against ~5.5M tokens per active day, which
-# puts a Pokemon at level 100 every ~18 active days (roughly 3-4 real weeks).
-TOKENS_PER_XP = 100
+# 50 work tokens = 1 XP. Calibrated against the deduplicated rate of ~1.9M work
+# tokens per active day, which puts a Pokemon at level 100 every ~26 active days
+# (roughly 8 calendar weeks at a pace of working every other day).
+#
+# An earlier value of 100 was derived from the pre-deduplication numbers and was
+# therefore 2.46x too slow, stretching a single Pokemon to ~15 weeks.
+TOKENS_PER_XP = 50
 
 # Synthetic levels for evolutions that are not level-based (stones, trade,
 # friendship). Without this, Eevee and Pikachu would never evolve.
