@@ -2,8 +2,8 @@
 
 Turns your Claude Code work into a Pokémon that levels up and evolves, shown in
 the macOS menu bar and in the Claude Code status line. Tokens and commits both
-earn XP; reach level 100 and it joins your Pokédex, so you can start raising the
-next one.
+earn XP. Retire it whenever you like and it joins your Pokédex at the level it
+reached, or push it to 100 for the badge — the pace of the collection is yours.
 
 <img src="docs/img/panel.png" alt="Charizard at level 82 in the macOS menu bar, with the panel open showing its type, XP bar and Pokedex button" width="330">
 
@@ -45,15 +45,56 @@ Two sources feed the same Pokémon, split by how often each happens.
 
 Commits grant XP rather than Pokémon on purpose. At nine a day, awarding a
 Pokémon per commit would bury the Pokédex under level-1 entries nobody trained
-and drown the ones actually raised to 100 — the Pokédex has to stay a record of
-what was trained, so there is a single route into it.
+and drown the ones actually raised — the Pokédex has to stay a record of what
+was trained, so training is the only route into it.
 
 Starting a brand new project does grant one, because it happens rarely enough to
 stay meaningful. Those are stored with their source and shown as *Obtenido*
-rather than *Lv.100*, so an awarded Pokémon never passes for a trained one.
+rather than a level, so an awarded Pokémon never passes for a trained one.
 
 Commits are counted from the transcript itself, not from git, so no repository
 needs a hook and every project counts automatically.
+
+## Setting your own pace
+
+Retiring files the active Pokémon at whatever level it reached and starts the
+next one. Level 100 is a badge, not a requirement — in the games you fill the
+Pokédex by catching, and nobody maxes 151 Pokémon.
+
+| Retire at | Each takes | Per year | 328 species in |
+|---|---|---|---|
+| Lv.40 | ~1 active day | ~183 | 1.8 years |
+| Lv.50 | ~2 active days | ~88 | 3.7 years |
+| Lv.60 | ~3.7 active days | ~49 | 6.7 years |
+| Lv.100 | ~18 active days | ~10 | with the ★ badge |
+
+The floor is level 40, and it is measured rather than picked: sampling 120
+chains, **98% have fully evolved by level 40** and the median last evolution is
+34.5. Anything above that is watching a number grow with no new form to see. A
+floor is needed at all because without one the whole roster could be retired at
+level 1 in an afternoon.
+
+### What you can train
+
+**328 base forms**, the starting point of every evolution chain in generations I
+to V. The other species in those generations are reached by levelling, not by
+picking — you get Charizard by raising a Charmander.
+
+The cap is species 649. That is where the animated pixel sprites stop (from 650
+only 475px official artwork exists, which sits badly beside pixel art) and it is
+also exactly the end of generation V — the two boundaries happen to coincide.
+PokéAPI itself carries 1025 species across 541 chains.
+
+## Shiny Pokémon
+
+Rolled once when a species starts being trained or is claimed, never on
+evolution — shininess is inherited, so a shiny Charmander yields a shiny
+Charizard. Purely cosmetic, marked with ✨ in the panel and the Pokédex.
+
+The odds are **1 in 45**, which lands near four a year at the ~183 encounters
+that retiring at the floor produces. Retire higher and you will see fewer, which
+is the trade rather than a flaw: hunting shinies costs Pokédex quality. The
+games use 1/8192, which at this cadence means never.
 
 ## The interesting parts
 
@@ -115,7 +156,7 @@ python3 engine/poketrainer.py scan               # incremental update (~0.1s)
 python3 engine/poketrainer.py backfill           # re-read all history
 python3 engine/poketrainer.py status             # dump state as JSON
 python3 engine/poketrainer.py candidates         # list species you can train
-python3 engine/poketrainer.py choose 4           # switch species (level 100 only)
+python3 engine/poketrainer.py retire 4           # file the current one, train #4
 python3 engine/poketrainer.py choose 4 --keep-xp # switch, carrying XP over
 python3 engine/poketrainer.py evolve 197         # pick a form on a branching stage
 python3 engine/poketrainer.py claim 25           # spend a new-project reward
@@ -130,6 +171,9 @@ Pace and rewards live at the top of `engine/poketrainer.py`:
 ```python
 TOKENS_PER_XP      = 50     # lower = faster levelling
 COMMIT_XP          = 2000   # XP per commit
+MIN_RETIRE_LEVEL   = 40     # lowest level a Pokemon may be retired at
+SHINY_CHANCE       = 45     # one in N new Pokemon is shiny
+MAX_SPECIES_ID     = 649    # end of gen V, where animated sprites stop
 FIXED_EVO_LEVEL    = 40     # for evolutions PokeAPI gives no level
 BACKFILL_MAX_LEVEL = 60     # ceiling on XP granted by replaying history
 ```
@@ -137,6 +181,10 @@ BACKFILL_MAX_LEVEL = 60     # ceiling on XP granted by replaying history
 At these values roughly 17 active days of heavy use reach level 100, and about a
 third of XP comes from commits rather than tokens. Adjust to taste, then re-run
 `backfill`.
+
+`MIN_RETIRE_LEVEL` and `SHINY_CHANCE` are coupled: lowering the floor multiplies
+how often you retire, and the shiny rate is per new Pokémon. Halve the floor's
+cost and you double the shinies.
 
 `BACKFILL_MAX_LEVEL` matters more than it looks. Without a ceiling, replaying a
 long history hands the very first Pokémon a nearly free run to 100 and makes
