@@ -13,11 +13,13 @@ Usage:
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +50,35 @@ TOKENS_PER_XP = 50
 FIXED_EVO_LEVEL = 40
 
 MAX_LEVEL = 100
+
+# Lowest level a Pokemon may be retired at.
+#
+# The XP curve is cubic, so half the total is spent between level 80 and 100 and
+# a Pokedex gated on 100 grows about nine entries a year — a pace that reads as
+# an achievement rather than a collection. Retiring early hands that pace to the
+# trainer instead, but with no floor the whole roster could be retired at level 1
+# in an afternoon, which is the clutter problem all over again.
+#
+# 40 is where a Pokemon is actually finished: sampling 120 chains, 98% have
+# fully evolved by then and the median last evolution is level 34.5. An earlier
+# floor of 50 sat ten levels past the point where anything still happens, so it
+# only bought grind. At roughly one active day per entry it also keeps the
+# collection reachable — 328 species is a decade at level 60, a couple of years
+# here.
+MIN_RETIRE_LEVEL = 40
+
+# Odds of a new Pokemon being shiny, as one in N. Rolled once when a species
+# starts being trained or is claimed, never on evolution: shininess is inherited,
+# so a shiny Charmander yields a shiny Charizard.
+#
+# The games use 1/8192, which at this cadence means never.
+#
+# Calibrated against retiring at the floor, which is where most retirements will
+# land since that is where a Pokemon has finished evolving: about 183 encounters
+# a year, so one in 45 gives roughly four. Retiring later means fewer encounters
+# and fewer shinies, which is the intended trade rather than a flaw — hunting
+# them costs Pokedex quality.
+SHINY_CHANCE = 45
 
 # Ceiling for XP granted by a backfill. Replaying a long history otherwise hands
 # the very first Pokemon a nearly free run to 100, which makes every later one
@@ -221,22 +252,27 @@ def evolution_line(species_id):
     return stages
 
 
-def ensure_sprites(species_id, kinds=("animated", "artwork")):
+def ensure_sprites(species_id, kinds=("animated", "artwork"), shiny=False):
     """Download the requested sprites once. Returns paths.
 
     `kinds` exists so bulk callers can skip the official artwork: it is ~150KB
     per species against ~20KB for the animated sprite, and the candidate grid
     only ever renders the small one.
+
+    Shiny variants live under a `shiny/` segment and are cached separately, so a
+    shiny Pokemon never overwrites the ordinary sprite of the same species.
     """
     SPRITES_DIR.mkdir(parents=True, exist_ok=True)
+    variant = "shiny/" if shiny else ""
+    suffix = "-shiny" if shiny else ""
     paths = {}
     for key, url, ext in (
-        ("animated", f"{SPRITE_BASE}/versions/generation-v/black-white/animated/{species_id}.gif", "gif"),
-        ("artwork", f"{SPRITE_BASE}/other/official-artwork/{species_id}.png", "png"),
+        ("animated", f"{SPRITE_BASE}/versions/generation-v/black-white/animated/{variant}{species_id}.gif", "gif"),
+        ("artwork", f"{SPRITE_BASE}/other/official-artwork/{variant}{species_id}.png", "png"),
     ):
         if key not in kinds:
             continue
-        target = SPRITES_DIR / f"{species_id}-{key}.{ext}"
+        target = SPRITES_DIR / f"{species_id}-{key}{suffix}.{ext}"
         if not target.exists():
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "train-your-pokemon/1.0"})
@@ -498,6 +534,9 @@ def ensure_active(state, species_id=None):
         "growth_rate": species["growth_rate"]["name"],
         "xp": 0,
         "level": 1,
+        # Rolled once, here. Shininess is inherited through the chain, so it is
+        # never re-rolled on evolution.
+        "shiny": random.randrange(SHINY_CHANCE) == 0,
         "line": line,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -583,6 +622,8 @@ def apply_xp(state, gained_xp, cap_level=None):
                 "name": active["name"],
                 "level": MAX_LEVEL,
                 "source": "trained",
+                "maxed": True,
+                "shiny": bool(active.get("shiny")),
                 "completed_at": active["completed_at"],
             })
         events.append({"type": "caught", "who": active["name"],
@@ -654,12 +695,17 @@ def update_display(state):
         "commits": state["totals"].get("commits", 0),
         # Rewards from new projects, waiting for a species to be picked.
         "unclaimed": state.get("unclaimed", 0),
+        # The trainer sets the pace: retire early for a wider Pokedex, or push
+        # to 100 for the badge.
+        "can_retire": level >= MIN_RETIRE_LEVEL,
+        "retire_level": MIN_RETIRE_LEVEL,
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
         # Set when the Pokemon has reached a branching stage and is waiting for
         # the trainer to pick a form. The panel renders the options.
         "pending_evolution": _with_option_sprites(active.get("pending_evolution")),
-        "sprites": ensure_sprites(active["species_id"]),
+        "shiny": bool(active.get("shiny")),
+        "sprites": ensure_sprites(active["species_id"], shiny=bool(active.get("shiny"))),
         # Cached here so the menu bar app can play it on open without paying
         # the cost of spawning Python.
         "cry": ensure_cry(active["species_id"]),
@@ -675,7 +721,12 @@ def update_display(state):
     os.replace(tmp, STATUSLINE_PATH)
 
 
-GEN1_MAX = 151
+# Highest species id offered for training. 649 is the end of generation V, and
+# it is exactly where the animated pixel sprites stop: from 650 on only the
+# 475px official artwork exists, which looks out of place beside pixel art in
+# the menu bar and the grid. PokeAPI itself goes to 1025.
+MAX_SPECIES_ID = 649
+
 CANDIDATES_PATH = CACHE_DIR / "candidates.json"
 
 
@@ -691,18 +742,22 @@ def base_forms():
             return json.load(fh)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    listing = _get_json(f"{POKEAPI}/evolution-chain?limit=80", "chain-list")
+    listing = _get_json(f"{POKEAPI}/evolution-chain?limit=2000", "chain-list")
 
-    forms = []
-    for entry in listing["results"]:
-        chain_id = _id_from_url(entry["url"])
+    def base_of(entry):
         try:
-            chain = get_evolution_chain(chain_id)["chain"]
+            chain = get_evolution_chain(_id_from_url(entry["url"]))["chain"]
         except Exception:
-            continue
+            return None
         species_id = _id_from_url(chain["species"]["url"])
-        if species_id <= GEN1_MAX:
-            forms.append({"species_id": species_id, "name": chain["species"]["name"]})
+        if species_id > MAX_SPECIES_ID:
+            return None
+        return {"species_id": species_id, "name": chain["species"]["name"]}
+
+    # Hundreds of chains, one request each: serially this takes ~13 minutes.
+    # Eight workers keeps it to a couple while staying polite to the API.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        forms = [f for f in pool.map(base_of, listing["results"]) if f]
 
     forms.sort(key=lambda f: f["species_id"])
     with open(CANDIDATES_PATH, "w") as fh:
@@ -722,11 +777,16 @@ def candidates(state):
             continue
 
     available = [f for f in base_forms() if f["species_id"] not in caught_bases]
-    for form in available:
-        # Only the small sprite: the grid never shows the 475px artwork, and
-        # fetching both for ~70 species is what made the first run take 2min.
+
+    # Only the small sprite: the grid never shows the 475px artwork, and
+    # fetching both is what made an early version crawl. Parallel for the same
+    # reason as the chain walk — there are hundreds of these.
+    def with_sprite(form):
         form["sprites"] = ensure_sprites(form["species_id"], kinds=("animated",))
-    return available
+        return form
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(with_sprite, available))
 
 
 def scan(from_scratch=False):
@@ -825,6 +885,41 @@ def main():
         save_state(state)
         print(f"{len(state['candidates'])} available")
 
+    elif command == "retire":
+        # Retires the active Pokemon into the Pokedex at whatever level it
+        # reached and starts the next one, in a single step. Doing both at once
+        # avoids ever having no active Pokemon, which the panel has no state for.
+        state = load_state()
+        active = state.get("active")
+        if not active:
+            print("Nothing to retire.")
+            return 1
+        if active["level"] < MIN_RETIRE_LEVEL:
+            print(f"{active['name'].capitalize()} is level {active['level']}. "
+                  f"Retiring needs level {MIN_RETIRE_LEVEL}.")
+            return 1
+        if len(sys.argv) < 3:
+            print("Name the species to train next: retire <species_id>")
+            return 1
+
+        # Reaching 100 already files it, so avoid a duplicate entry.
+        if not any(p["species_id"] == active["species_id"] for p in state["pokedex"]):
+            state["pokedex"].append({
+                "species_id": active["species_id"],
+                "name": active["name"],
+                "level": active["level"],
+                "source": "trained",
+                "maxed": active["level"] >= MAX_LEVEL,
+                "shiny": bool(active.get("shiny")),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+        retired = f"{active['name']} Lv.{active['level']}"
+
+        ensure_active(state, species_id=int(sys.argv[2]))
+        update_display(state)
+        save_state(state)
+        print(f"Retired {retired}. Now training {state['active']['name']}.")
+
     elif command == "claim":
         # Spends a reward earned by starting a new project. The Pokemon goes
         # straight into the Pokedex marked as awarded, so it never passes for
@@ -845,6 +940,7 @@ def main():
             "name": base["name"],
             "level": 1,
             "source": "project",
+            "shiny": random.randrange(SHINY_CHANCE) == 0,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         })
         state["unclaimed"] -= 1
