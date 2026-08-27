@@ -966,6 +966,10 @@ def update_display(state):
         # The trainer sets the pace: retire early for a wider Pokedex, or push
         # to 100 for the badge.
         "can_retire": level >= MIN_RETIRE_LEVEL,
+        # Whether retiring may hand out a new species, or only promote the bench.
+        "can_start_new": active.get("filed_level") is None
+                         or level > active["filed_level"],
+        "filed_level": active.get("filed_level"),
         "retire_level": MIN_RETIRE_LEVEL,
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
@@ -982,7 +986,13 @@ def update_display(state):
         "party": _party_view(state),
         "party_size": PARTY_SIZE,
         # The Pokedex counts species ever owned; `caught` counts what is stored.
-        "dex_registered": len(state.get("dex", {})),
+        #
+        # Bounded by the grid's own range: branch evolutions reach past gen V —
+        # Eevee alone offers Sylveon at 700 — and those stay in the registry as
+        # a true record of having owned them, but counting them against a total
+        # of 649 produced headline numbers like "650/649".
+        "dex_registered": sum(1 for key in state.get("dex", {})
+                              if int(key) <= MAX_SPECIES_ID),
         "dex_total": MAX_SPECIES_ID,
     }
 
@@ -1172,9 +1182,12 @@ def main():
         # Rebuilds the registry and writes the grid the panel renders. Kept out
         # of `scan` because it fetches a sprite for every species in range: a
         # one-off cost, not something to pay every 30 seconds.
+        # Deliberately does not save: this runs while the menu bar's 30-second
+        # scan may be mid-flight, and a load-modify-write here would roll back
+        # that tick's cursors and XP. Every scan reconstructs the registry
+        # anyway, so persisting it is the scan's job, not this command's.
         state = load_state()
         reconstruct_dex(state)
-        save_state(state)
         dex = state.get("dex", {})
         started = time.time()
 
@@ -1240,6 +1253,17 @@ def main():
         # by filtering the grid but the command has to check for itself. Without
         # this the chain being retired could be started again in the same breath
         # and end up in the PC and on the team at once.
+        # Starting a new species is what makes the collection grow, so it costs
+        # progress: a Pokemon that has not gained a level since it was last put
+        # away has achieved nothing to be rewarded for. Promoting the bench is
+        # always available, since that hands out nothing.
+        filed_at = active.get("filed_level")
+        if len(sys.argv) >= 3 and filed_at is not None and active["level"] <= filed_at:
+            print(f"{active['name'].capitalize()} has not gained a level since it went "
+                  f"into the PC at Lv.{filed_at}. Train it further, or retire it by "
+                  f"promoting the bench.")
+            return 1
+
         if len(sys.argv) >= 3:
             successor = evolution_line(int(sys.argv[2]))[0]
             if successor["species_id"] in training_bases(state):
@@ -1379,6 +1403,11 @@ def main():
         # earned: a Lv.100 badge or a project award would otherwise come back as
         # a plain deposit and drop out of the caught count for good.
         record["filed_source"] = stored[index].get("source", "trained")
+        # Retiring hands out a new species, and that is a reward for training.
+        # Without remembering the level it went in at, a Pokemon could be taken
+        # out and filed again unchanged, over and over, each round trip paying
+        # out another Pokemon for no work at all.
+        record["filed_level"] = stored[index].get("level", 0)
         # A Pokemon that reached 100 is filed while still being trained, so it
         # can be in storage and on the team at once. Withdrawing it then would
         # clone it.

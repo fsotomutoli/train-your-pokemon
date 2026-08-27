@@ -89,19 +89,32 @@ keeps the team from becoming storage: filling the last slot means retiring
 someone first, and retiring still needs level 40. Without a limit a dozen
 Pokémon would sit at level 5 forever and the collection would never grow.
 
-Retiring with someone on the bench hands training straight to them instead of
-asking for a new species, which is also how a slot is freed.
+Retiring with someone on the bench asks what should happen to the slot it
+leaves. Promoting whoever is next frees it, which is how the team shrinks;
+starting a new species instead keeps the team the same size and leaves the
+retired one waiting in the PC. An earlier version promoted silently, and that
+quietly capped the team at two — the only way to add a member is for a new
+Pokémon to enter the world, and promoting never creates one.
 
 A slot is filled from the PC and nowhere else. The panel will not hand out a
 fresh species on request, because that would bypass both routes that make
 getting a Pokémon mean something — retiring one at the floor, or being awarded
 one for starting a project — and turn the roster into something asked for rather
-than earned. So the team grows as the collection does:
+than earned.
+
+Starting a new species costs progress: a Pokémon that has not gained a level
+since it was last put in the PC has achieved nothing to be paid for, and the
+option is refused. Without that, one already-trained Pokémon could be retired and
+withdrawn over and over, filling the team with free level-1 species while earning
+no XP at all. Promoting the bench is never gated, because it hands out nothing.
+
+So the team grows by one for every **level gained past the last time a Pokémon
+was filed**, with no separate currency to track:
 
 ```
-train → retire at Lv.40 → it goes to the PC → start the next one
-                                 │
-                                 └── take it back out → now two on the team
+train to Lv.40 → retire, start a new species → the trained one waits in the PC
+                                                        │
+                                            take it back out → the team is one bigger
 ```
 
 Starting fresh with a species the panel does not offer is still possible from

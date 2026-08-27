@@ -143,7 +143,23 @@ enum Sprites {
     /// Pokedex passes a label colour instead: a white silhouette on the light
     /// theme's panel would be invisible.
     static func silhouette(_ path: String, color: NSColor = .white) -> NSImage? {
-        let key = "\(path)|\(color.description)" as NSString
+        // Keyed on the resolved colour, not the NSColor itself: a dynamic system
+        // colour describes itself identically in both appearances ("Catalog
+        // color: System secondaryLabelColor") while rendering black in light and
+        // white in dark. The bitmap is baked at lockFocus time, so a shared key
+        // meant that switching appearance left every silhouette painted for the
+        // old one — black on a dark panel, invisible — until the app restarted.
+        // Resolved against the app's appearance explicitly rather than whatever
+        // drawing appearance happens to be current inside a SwiftUI body, so the
+        // key and the pixels it labels are always derived from the same one.
+        var resolved = color
+        let appearance = NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB) ?? color
+        }
+        let key = String(format: "%@|%.3f,%.3f,%.3f,%.3f", path,
+                         resolved.redComponent, resolved.greenComponent,
+                         resolved.blueComponent, resolved.alphaComponent) as NSString
         if let cached = silhouetteCache.object(forKey: key) { return cached }
 
         guard let data = FileManager.default.contents(atPath: path),
@@ -155,7 +171,7 @@ enum Sprites {
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .none
         rep.draw(in: box)
-        color.setFill()
+        resolved.setFill()
         // sourceAtop paints only where pixels already exist. Filling a
         // background first tints that too and yields a solid rectangle.
         box.fill(using: .sourceAtop)

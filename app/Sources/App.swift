@@ -73,6 +73,10 @@ struct Display: Decodable {
     var unclaimed: Int?
     var can_retire: Bool?
     var retire_level: Int?
+    /// Whether retiring may hand out a new species. False for a Pokemon taken
+    /// out of the PC that has not gained a level since.
+    var can_start_new: Bool?
+    var filed_level: Int?
     var shiny: Bool?
     var next_evo: String?
     var next_evo_level: Int?
@@ -471,6 +475,8 @@ struct TrainerPanel: View {
     /// The PC is reachable from the main view and from the team, so "back" has
     /// to return where it was opened from.
     @State private var storageReturn: PanelRoute = .active
+    /// Retiring with a bench asks what comes next instead of assuming.
+    @State private var retireChoice = false
     /// Team member awaiting confirmation to go to the PC. Offered only with a
     /// full team, which is the one situation where a slot has to be freed.
     @State private var depositing: PartyMember?
@@ -593,7 +599,11 @@ struct TrainerPanel: View {
                 trainer.loadDex()
                 route = .dex
             } label: {
-                Label("Pokédex (\(display.dex_registered ?? 0)/\(display.dex_total ?? 649))",
+                // The loaded registry wins over the display block, which is only
+                // refreshed by a scan: without this the button could still read
+                // "0/649" while the grid behind it showed the real count.
+                Label("Pokédex (\(trainer.dex?.registered ?? display.dex_registered ?? 0)"
+                      + "/\(trainer.dex?.total ?? display.dex_total ?? 649))",
                       systemImage: "book.fill")
                     .frame(maxWidth: .infinity)
             }
@@ -613,28 +623,49 @@ struct TrainerPanel: View {
             // starts the next one. The floor exists so an entry still means
             // something; the engine enforces it independently.
             if display.can_retire == true {
-                // With someone on the bench, retiring hands training over to
-                // them and the team shrinks by one — which is also the only way
-                // to free a slot. With an empty bench there is nobody to
-                // promote, so a new species has to be picked.
+                // With an empty bench there is nobody to promote, so retiring
+                // goes straight to picking the next species. With a bench both
+                // are valid and mean different things, so it asks: promoting
+                // frees a slot, while starting a new species keeps the team the
+                // same size and leaves the retired one waiting in the PC — which
+                // is the only way the collection grows past what you already
+                // hold. Deciding this silently is what made the team unable to
+                // grow beyond two.
                 let next = display.bench.first
-                Button {
-                    if next != nil {
-                        trainer.retireAndPromote()
-                    } else {
-                        trainer.loadCandidates()
-                        picking = .retire
-                        route = .picker
+                let canStartNew = display.can_start_new ?? true
+
+                if next == nil && !canStartNew {
+                    // Nobody to promote and nothing earned to spend: retiring
+                    // now would file it exactly as it already is.
+                    Text("\(display.name.capitalized) volvió del PC en Lv.\(display.filed_level ?? display.level) y no ha subido desde entonces. Entrénalo un poco más para poder retirarlo otra vez.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 6)
+                } else {
+                    Button {
+                        if next != nil {
+                            retireChoice = true
+                        } else {
+                            trainer.loadCandidates()
+                            picking = .retire
+                            route = .picker
+                        }
+                    } label: {
+                        Label(retireLabel(display: display),
+                              systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity)
                     }
-                } label: {
-                    Label(retireLabel(display: display, next: next),
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .frame(maxWidth: .infinity)
+                    // A ternary of two styles will not typecheck: they are
+                    // different types. The prominent slot belongs to evolution.
+                    .buttonStyle(.bordered)
+                    .padding(.top, 6)
+
+                    if retireChoice, let next {
+                        retireChoiceStrip(display: display, next: next,
+                                          canStartNew: canStartNew)
+                    }
                 }
-                // A ternary of two styles will not typecheck: they are
-                // different types. The prominent slot belongs to evolution.
-                .buttonStyle(.bordered)
-                .padding(.top, 6)
             } else {
                 Text("Podrás retirarlo desde el nivel \(display.retire_level ?? 50).")
                     .font(.caption2)
@@ -656,12 +687,53 @@ struct TrainerPanel: View {
         }
     }
 
-    /// Names what retiring will actually do, which depends on whether anyone is
-    /// waiting on the bench to take over.
-    private func retireLabel(display: Display, next: PartyMember?) -> String {
-        let at = display.level >= 100 ? "Retirar" : "Retirar en Lv.\(display.level)"
-        guard let next else { return "\(at) y entrenar otro" }
-        return "\(at) y seguir con \(next.name.capitalized)"
+    private func retireLabel(display: Display) -> String {
+        display.level >= 100 ? "Retirar" : "Retirar en Lv.\(display.level)"
+    }
+
+    /// The two ways a retirement can go. Both file the Pokemon in the PC; they
+    /// differ in who trains next, and therefore in whether the collection grows.
+    private func retireChoiceStrip(display: Display, next: PartyMember,
+                                   canStartNew: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("\(display.name.capitalized) Lv.\(display.level) se guarda en el PC. ¿Quién entrena ahora?")
+                .font(.caption.bold())
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Button("\(next.name.capitalized) (Lv.\(next.level))") {
+                    trainer.retireAndPromote()
+                    retireChoice = false
+                }
+                .buttonStyle(.bordered)
+                Text("Ya está en tu equipo; quedará un cupo libre.")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Button("Una especie nueva") {
+                    trainer.loadCandidates()
+                    picking = .retire
+                    retireChoice = false
+                    route = .picker
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canStartNew)
+                Text(canStartNew
+                     ? "Empieza en Lv.1 y suma uno a tu colección."
+                     : "Volvió del PC en Lv.\(display.filed_level ?? display.level) y no ha subido desde entonces: entrénalo para volver a ganarlo.")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button("Cancelar") { retireChoice = false }
+                .buttonStyle(.borderless)
+                .font(.caption2)
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.top, 6)
     }
 
     private var partyView: some View {
@@ -792,17 +864,26 @@ struct TrainerPanel: View {
     }
 
     /// Why an empty slot cannot be filled yet, in the order the steps actually
-    /// happen. Names the level the Pokemon being trained is at, so the distance
-    /// to retiring is a number rather than a rule to work out.
+    /// happen and only naming routes that would really add a member.
     private func emptyPCHint(_ display: Display?) -> String {
-        let floor = display?.retire_level ?? 40
-        let base = "Un cupo se llena sacando a alguien del PC, y el PC está vacío. "
-            + "Un Pokémon llega al PC al retirarlo, o al ganarlo empezando un proyecto nuevo."
-        guard let display else { return base }
-        if display.level >= floor {
-            return base + " Ya puedes retirar a \(display.name.capitalized)."
+        // Nothing to withdraw is not the same as an empty PC: a Pokemon that
+        // reached 100 is filed while still being trained, so it sits in both.
+        if !trainer.state.pokedex.isEmpty {
+            return "Lo que hay en el PC ya está en el equipo, así que no hay a quién sacar."
         }
-        return base + " Retirar necesita Lv.\(floor), y \(display.name.capitalized) va en \(display.level)."
+        guard let display else {
+            return "Un cupo se llena sacando a alguien del PC, y está vacío."
+        }
+
+        let floor = display.retire_level ?? 40
+        let who = display.name.capitalized
+        if display.level >= floor {
+            return "Un cupo se llena desde el PC, y está vacío. Ya puedes retirar a "
+                + "\(who): entra al PC, empiezas otra especie, y después lo sacas."
+        }
+        return "Un cupo se llena desde el PC, y está vacío. Retira a \(who) para "
+            + "guardarlo ahí y empezar otra especie: necesita Lv.\(floor) y va en "
+            + "\(display.level)."
     }
 
     private func partyRow(_ member: PartyMember) -> some View {
