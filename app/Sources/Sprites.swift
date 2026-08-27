@@ -129,7 +129,23 @@ enum Sprites {
     /// `.sourceAtop`, which paints only where pixels already exist. Filling a
     /// background first instead would tint the background too and return a
     /// solid white rectangle.
-    static func silhouette(_ path: String) -> NSImage? {
+    /// Silhouettes are built often enough in the Pokedex grid — 649 cells, each
+    /// decoding a GIF — that rebuilding them on every scroll is wasteful. NSCache
+    /// evicts under memory pressure on its own, which matters on a machine whose
+    /// swap is already loaded.
+    private static let silhouetteCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 250
+        return cache
+    }()
+
+    /// White by default, which is what the evolution animation wants. The
+    /// Pokedex passes a label colour instead: a white silhouette on the light
+    /// theme's panel would be invisible.
+    static func silhouette(_ path: String, color: NSColor = .white) -> NSImage? {
+        let key = "\(path)|\(color.description)" as NSString
+        if let cached = silhouetteCache.object(forKey: key) { return cached }
+
         guard let data = FileManager.default.contents(atPath: path),
               let rep = NSBitmapImageRep(data: data) else { return nil }
         rep.setProperty(.currentFrame, withValue: 0)
@@ -139,9 +155,13 @@ enum Sprites {
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .none
         rep.draw(in: box)
-        NSColor.white.setFill()
+        color.setFill()
+        // sourceAtop paints only where pixels already exist. Filling a
+        // background first tints that too and yields a solid rectangle.
         box.fill(using: .sourceAtop)
         image.unlockFocus()
+
+        silhouetteCache.setObject(image, forKey: key)
         return image
     }
 

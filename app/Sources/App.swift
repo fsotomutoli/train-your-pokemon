@@ -22,6 +22,28 @@ struct PendingEvolution: Decodable {
     var options: [EvolutionOption]
 }
 
+/// One row of the Pokedex: a species, and whether it was ever owned. Unowned
+/// entries carry no name — the games show ????? until you have had one, and the
+/// engine skips 600-odd lookups by not resolving them.
+struct DexEntry: Decodable, Identifiable {
+    var species_id: Int
+    var name: String?
+    var registered: Bool
+    var shiny: Bool
+    var sprite: String?
+    var id: Int { species_id }
+}
+
+/// The whole registry, read from its own file rather than the state the menu bar
+/// reloads every 30 seconds: 649 entries is too much to carry there.
+struct Dex: Decodable {
+    var total: Int
+    var registered: Int
+    var entries: [Lossy<DexEntry>]
+
+    var rows: [DexEntry] { entries.compactMap(\.value) }
+}
+
 /// One Pokemon on the team. Only the active one earns XP; the rest are frozen
 /// at the level they were benched at.
 struct PartyMember: Decodable, Identifiable {
@@ -61,6 +83,9 @@ struct Display: Decodable {
     /// of failing the whole Display and blanking the menu bar.
     var party: [Lossy<PartyMember>]?
     var party_size: Int?
+    /// Species ever owned, against `caught` which counts what the PC holds.
+    var dex_registered: Int?
+    var dex_total: Int?
 
     var partyMembers: [PartyMember] { (party ?? []).compactMap(\.value) }
     var bench: [PartyMember] { partyMembers.filter { !$0.active } }
@@ -164,14 +189,14 @@ struct AnimatedSprite: NSViewRepresentable {
 // MARK: - Engine bridge
 
 enum PanelRoute {
-    case active, pokedex, picker, evolution, party
+    case active, pokedex, picker, evolution, party, dex
 }
 
 /// What the shared candidate grid is being opened for. An enum rather than a
 /// flag per case: the three are mutually exclusive and a stray combination of
 /// booleans would silently pick the wrong action.
 enum PickerPurpose {
-    case claim, retire, add
+    case claim, retire
 }
 
 @MainActor
@@ -179,6 +204,8 @@ final class Trainer: ObservableObject {
     @Published var state = TrainerState()
     @Published var isWorking = false
     @Published var isLoadingCandidates = false
+    @Published var isLoadingDex = false
+    @Published var dex: Dex?
 
     private let statePath = NSHomeDirectory() + "/.claude/pokemon-state.json"
     private var timer: Timer?
@@ -321,19 +348,6 @@ final class Trainer: ObservableObject {
         }
     }
 
-    /// Adds a species to the team and starts training it, benching the current
-    /// one. Refused by the engine once the six slots are taken.
-    func addToParty(_ speciesID: Int) {
-        Task.detached(priority: .userInitiated) {
-            Self.runEngine(["party", String(speciesID)])
-            Self.runEngine(["candidates"])
-            await MainActor.run {
-                self.load()
-                self.playCry(speciesID: speciesID)
-            }
-        }
-    }
-
     /// Puts a team member in the PC at whatever level it is, which is the only
     /// way to free a slot below the retirement floor. Nothing is lost: the entry
     /// is marked as stored and can be taken back out.
@@ -378,6 +392,23 @@ final class Trainer: ObservableObject {
             await MainActor.run {
                 self.load()
                 self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
+    /// Rebuilds the registry and reads it back. The first run downloads a sprite
+    /// for every species in range (~12s); afterwards they are on disk.
+    func loadDex() {
+        guard !isLoadingDex else { return }
+        isLoadingDex = true
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["dex"])
+            let path = NSHomeDirectory() + "/.claude/pokemon-dex.json"
+            let decoded = FileManager.default.contents(atPath: path)
+                .flatMap { try? JSONDecoder().decode(Dex.self, from: $0) }
+            await MainActor.run {
+                if let decoded { self.dex = decoded }
+                self.isLoadingDex = false
             }
         }
     }
@@ -431,7 +462,7 @@ struct TrainerPanel: View {
     @ObservedObject var trainer: Trainer
     @State private var route: PanelRoute = .active
     /// The candidate grid is shared by three flows; this says which one opened it.
-    @State private var picking: PickerPurpose = .add
+    @State private var picking: PickerPurpose = .retire
     /// Form the animation is currently morphing into, once chosen.
     @State private var evolvingTo: EvolutionOption?
     /// Stored Pokemon awaiting confirmation to come back out. The grid cells are
@@ -452,6 +483,7 @@ struct TrainerPanel: View {
             case .picker: pickerView
             case .evolution: evolutionView
             case .party: partyView
+            case .dex: dexView
             }
         }
         .frame(width: 280)
@@ -556,6 +588,16 @@ struct TrainerPanel: View {
                       systemImage: "person.2.fill")
                     .frame(maxWidth: .infinity)
             }
+
+            Button {
+                trainer.loadDex()
+                route = .dex
+            } label: {
+                Label("Pokédex (\(display.dex_registered ?? 0)/\(display.dex_total ?? 649))",
+                      systemImage: "book.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(.top, 6)
 
             Button {
                 withdrawing = nil
@@ -679,10 +721,11 @@ struct TrainerPanel: View {
                 }
             }
 
-            // Two doors rather than one merged list: the PC holds a handful of
-            // Pokemon and there are 300-odd species that have never been
-            // trained, so mixing them reads as a species catalogue with the
-            // trainer's own Pokemon as a footnote. Each button names its source.
+            // A team slot is filled from the PC and nowhere else. Handing out
+            // fresh species here would bypass both routes that make getting a
+            // Pokemon mean something — retiring one at the floor, or being
+            // awarded one for starting a project — and turn the roster into
+            // something asked for rather than earned.
             if members.count < capacity {
                 if !withdrawableEntries.isEmpty {
                     Button {
@@ -694,15 +737,15 @@ struct TrainerPanel: View {
                               systemImage: "tray.and.arrow.up.fill")
                             .frame(maxWidth: .infinity)
                     }
-                }
-
-                Button {
-                    trainer.loadCandidates()
-                    picking = .add
-                    route = .picker
-                } label: {
-                    Label("Empezar una especie nueva", systemImage: "plus.circle.fill")
-                        .frame(maxWidth: .infinity)
+                } else {
+                    // Spelling out the two steps matters: an earlier version put
+                    // "Lv.40" and "cupo" in one sentence and read as if reaching
+                    // 40 handed you a team slot. It does not — it lets you
+                    // retire, retiring fills the PC, and the PC fills the slot.
+                    Text(emptyPCHint(display))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             } else {
                 Text("Equipo completo. Envía a uno al PC para hacer espacio — vuelve con su nivel cuando lo saques.")
@@ -748,6 +791,20 @@ struct TrainerPanel: View {
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
     }
 
+    /// Why an empty slot cannot be filled yet, in the order the steps actually
+    /// happen. Names the level the Pokemon being trained is at, so the distance
+    /// to retiring is a number rather than a rule to work out.
+    private func emptyPCHint(_ display: Display?) -> String {
+        let floor = display?.retire_level ?? 40
+        let base = "Un cupo se llena sacando a alguien del PC, y el PC está vacío. "
+            + "Un Pokémon llega al PC al retirarlo, o al ganarlo empezando un proyecto nuevo."
+        guard let display else { return base }
+        if display.level >= floor {
+            return base + " Ya puedes retirar a \(display.name.capitalized)."
+        }
+        return base + " Retirar necesita Lv.\(floor), y \(display.name.capitalized) va en \(display.level)."
+    }
+
     private func partyRow(_ member: PartyMember) -> some View {
         HStack(spacing: 8) {
             if let image = Sprites.image(member.spritePath) {
@@ -786,6 +843,91 @@ struct TrainerPanel: View {
         .background(member.active ? Color.primary.opacity(0.08) : .clear,
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
+    }
+
+    private var dexView: some View {
+        let dex = trainer.dex
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Pokédex").font(.headline)
+                Spacer()
+                Text("\(dex?.registered ?? trainer.state.display?.dex_registered ?? 0)"
+                     + "/\(dex?.total ?? trainer.state.display?.dex_total ?? 649)")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+
+            Text("Se registra al momento de tener una, y nunca baja. Las que faltan salen en silueta.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let dex {
+                ScrollView {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 5),
+                              spacing: 8) {
+                        ForEach(dex.rows) { entry in
+                            dexCell(entry)
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+            } else {
+                VStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(trainer.isLoadingDex
+                         ? "Armando la Pokédex…"
+                         : "Sin datos todavía.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    // Only the first build pays for the sprites; after that the
+                    // whole range is on disk.
+                    Text("La primera vez baja el sprite de las 649.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+                .frame(height: 120)
+            }
+
+            Button("‹ Volver") { route = .active }
+                .buttonStyle(.borderless)
+                .font(.caption)
+        }
+    }
+
+    private func dexCell(_ entry: DexEntry) -> some View {
+        VStack(spacing: 1) {
+            if let path = entry.sprite {
+                if entry.registered {
+                    if let image = Sprites.image(path) {
+                        Image(nsImage: image)
+                            .resizable().interpolation(.none)
+                            .scaledToFit().frame(height: 28)
+                    } else {
+                        Color.clear.frame(height: 28)
+                    }
+                } else if let shape = Sprites.silhouette(path, color: .secondaryLabelColor) {
+                    // Label colour rather than white: this has to read on both
+                    // the light and the dark panel.
+                    Image(nsImage: shape)
+                        .resizable().interpolation(.none)
+                        .scaledToFit().frame(height: 28)
+                        .opacity(0.45)
+                } else {
+                    Color.clear.frame(height: 28)
+                }
+            } else {
+                Color.clear.frame(height: 28)
+            }
+
+            Text(entry.registered
+                 ? (entry.shiny ? "✨" : "") + (entry.name?.capitalized ?? "?????")
+                 : "#\(String(format: "%03d", entry.species_id))")
+                .font(.system(size: 7))
+                .lineLimit(1)
+                .foregroundStyle(entry.registered ? .secondary : .tertiary)
+        }
+        .help(entry.registered
+              ? "\(entry.name?.capitalized ?? "") · Nº\(entry.species_id)"
+              : "Nº\(entry.species_id) — todavía no la tienes")
     }
 
     private var pokedexView: some View {
@@ -999,8 +1141,6 @@ struct TrainerPanel: View {
                             trainer.claim(candidate.species_id)
                         case .retire:
                             trainer.retire(startingWith: candidate.species_id)
-                        case .add:
-                            trainer.addToParty(candidate.species_id)
                         }
                         route = .active
                     } cell: { candidate in
@@ -1010,7 +1150,7 @@ struct TrainerPanel: View {
                 .frame(maxHeight: 220)
             }
 
-            Button("‹ Volver") { route = picking == .add ? .party : .active }
+            Button("‹ Volver") { route = .active }
             .buttonStyle(.borderless)
             .font(.caption)
         }
@@ -1071,7 +1211,6 @@ struct TrainerPanel: View {
         switch picking {
         case .claim: return "Reclamar Pokémon"
         case .retire: return "Elegir Pokémon"
-        case .add: return "Especie nueva"
         }
     }
 
@@ -1081,8 +1220,6 @@ struct TrainerPanel: View {
             return "Entra directo al PC de Bill, marcado como obtenido."
         case .retire:
             return "Empieza en nivel 1 desde la base de su línea evolutiva."
-        case .add:
-            return "Nunca entrenada: empieza en nivel 1 desde la base de su línea. Pasa a ser la que entrenas y el actual va a la banca."
         }
     }
 }

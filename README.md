@@ -92,6 +92,22 @@ Pokémon would sit at level 5 forever and the collection would never grow.
 Retiring with someone on the bench hands training straight to them instead of
 asking for a new species, which is also how a slot is freed.
 
+A slot is filled from the PC and nowhere else. The panel will not hand out a
+fresh species on request, because that would bypass both routes that make
+getting a Pokémon mean something — retiring one at the floor, or being awarded
+one for starting a project — and turn the roster into something asked for rather
+than earned. So the team grows as the collection does:
+
+```
+train → retire at Lv.40 → it goes to the PC → start the next one
+                                 │
+                                 └── take it back out → now two on the team
+```
+
+Starting fresh with a species the panel does not offer is still possible from
+the command line (`party <id>`), which exists for setting up a state rather than
+for playing.
+
 With a full team, and only then, any member can be put in the PC at whatever
 level it is. That is the way out of a team filled by accident: freeing a slot
 otherwise needs level 40, so a couple of mis-taps could lock the team for days.
