@@ -61,8 +61,6 @@ struct Display: Decodable {
     /// of failing the whole Display and blanking the menu bar.
     var party: [Lossy<PartyMember>]?
     var party_size: Int?
-    /// Everything in the PC, against `caught` which counts only finished stints.
-    var stored: Int?
 
     var partyMembers: [PartyMember] { (party ?? []).compactMap(\.value) }
     var bench: [PartyMember] { partyMembers.filter { !$0.active } }
