@@ -9,6 +9,10 @@ Usage:
     poketrainer.py backfill      # re-read the whole history from scratch
     poketrainer.py status        # print state as JSON
     poketrainer.py choose <id>   # switch the active Pokemon
+    poketrainer.py party <id>    # add a species to the team and train it
+    poketrainer.py switch <id>   # rotate to another member of the team
+    poketrainer.py withdraw <id> # take one out of storage and train it again
+    poketrainer.py deposit <id>  # put a team member in the PC to free a slot
 """
 
 import json
@@ -66,6 +70,16 @@ MAX_LEVEL = 100
 # collection reachable — 328 species is a decade at level 60, a couple of years
 # here.
 MIN_RETIRE_LEVEL = 40
+
+# Slots on the team, counting the Pokemon currently being trained. Only that one
+# earns XP; the rest sit on the bench frozen at the level they were parked at, so
+# a chain can be put down when it gets boring and picked back up unchanged.
+#
+# Six is the party size the games use, and a limit is what keeps the team from
+# turning into storage: with the sixth slot full, adding another means retiring
+# someone first, which is gated on level 40. Unlimited slots would let a dozen
+# Pokemon sit at level 5 forever and the Pokedex would never grow.
+PARTY_SIZE = 6
 
 # Odds of a new Pokemon being shiny, as one in N. Rolled once when a species
 # starts being trained or is claimed, never on evolution: shininess is inherited,
@@ -128,6 +142,11 @@ def empty_state():
     return {
         "version": 1,
         "active": None,
+        "bench": [],
+        # Stored Pokemon. The key is the original name and stays for
+        # compatibility with existing state files, but this is storage rather
+        # than a registry — entries come back out — and the panel calls it
+        # Bill's PC.
         "pokedex": [],
         "totals": {"xp_all_time": 0, "work_tokens": 0},
         "daily": {},
@@ -517,6 +536,128 @@ def collect_tokens(state, from_scratch=False):
 # Progression
 # --------------------------------------------------------------------------
 
+def _snapshot(record):
+    """Deep copy through JSON, so a stored record cannot be mutated later
+    through a shared `line` or `choices` object."""
+    return json.loads(json.dumps(record))
+
+
+def entry_base(entry):
+    """Base species of a stored entry's chain.
+
+    Entries written before records existed have to be resolved through the API
+    cache; newer ones carry it already.
+    """
+    record = entry.get("record") or {}
+    if record.get("base_species_id"):
+        return record["base_species_id"]
+    try:
+        return evolution_line(entry["species_id"])[0]["species_id"]
+    except Exception:
+        return entry["species_id"]
+
+
+def file_in_pc(state, member, source):
+    """Put a Pokemon in the PC, keeping one entry per chain.
+
+    Matched on the chain rather than the current form, because a Pokemon is
+    filed the moment it reaches level 100 and evolution waits for the trainer to
+    watch it: a Charmander filed at 100 and evolved afterwards would come back
+    as a second entry under Charizard. An existing entry is replaced instead, so
+    the PC shows the furthest form and level the chain ever reached.
+    """
+    entry = {
+        "species_id": member["species_id"],
+        "name": member["name"],
+        "level": member["level"],
+        "source": source,
+        "maxed": member["level"] >= MAX_LEVEL,
+        "shiny": bool(member.get("shiny")),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        # Kept whole so taking it back out restores it exactly, rather than
+        # rebuilding an approximation from level and species.
+        "record": _snapshot(member),
+    }
+    base = member.get("base_species_id") or entry_base(entry)
+    for index, existing in enumerate(state["pokedex"]):
+        if entry_base(existing) == base:
+            state["pokedex"][index] = entry
+            return entry
+    state["pokedex"].append(entry)
+    return entry
+
+
+def record_from_entry(entry):
+    """Rebuild a trainable record from a stored entry.
+
+    Entries filed before Pokemon could be taken back out carry only species,
+    level and badge, so everything else is derived: the chain from the species,
+    the XP from what that level is worth on its curve, and the branch it took
+    from the form it was stored as.
+
+    The derived XP is exactly the level's threshold rather than anything above
+    it. Progress towards the next level was never recorded, and inventing some
+    would be worse than starting the level clean.
+    """
+    stored = entry.get("record")
+    if stored:
+        return _snapshot(stored)
+
+    species_id = entry["species_id"]
+    line = evolution_line(species_id)
+    growth_rate = get_species(species_id)["growth_rate"]["name"]
+    curve = xp_curve(growth_rate)
+    level = max(1, min(int(entry.get("level", 1)), MAX_LEVEL))
+
+    record = {
+        "species_id": species_id,
+        "name": entry["name"],
+        "base_species_id": line[0]["species_id"],
+        "growth_rate": growth_rate,
+        "xp": curve.get(level, 0),
+        "level": level,
+        "shiny": bool(entry.get("shiny")),
+        "line": line,
+        "started_at": entry.get("completed_at") or datetime.now(timezone.utc).isoformat(),
+    }
+
+    # The branch it took, so a forked chain comes back on the same fork instead
+    # of being offered the choice a second time.
+    choices = {index: species_id
+               for index, stage in enumerate(line)
+               if index and any(o["species_id"] == species_id for o in stage["options"])}
+    if choices:
+        record["choices"] = {str(k): v for k, v in choices.items()}
+
+    # Already maxed: keep the mark, or apply_xp would file it straight back into
+    # storage and undo the withdrawal on the spot.
+    if level >= MAX_LEVEL:
+        record["completed_at"] = entry.get("completed_at")
+
+    return record
+
+
+def bench(state):
+    """Team members that are not the one currently earning XP.
+
+    Kept beside `active` rather than folding the active Pokemon into a list with
+    an index, because every frontend and half the engine reads `state["active"]`
+    directly; a bench is additive and states written before the team existed
+    still load.
+    """
+    return state.setdefault("bench", [])
+
+
+def party_slots_used(state):
+    return len(bench(state)) + (1 if state.get("active") else 0)
+
+
+def training_bases(state):
+    """Base species of every chain on the team, active and benched alike."""
+    members = bench(state) + ([state["active"]] if state.get("active") else [])
+    return {m["base_species_id"] for m in members if m.get("base_species_id")}
+
+
 def ensure_active(state, species_id=None):
     if state.get("active") and species_id is None:
         return state["active"]
@@ -615,17 +756,7 @@ def apply_xp(state, gained_xp, cap_level=None):
     # Level 100: goes into the Pokedex and becomes swappable.
     if active["level"] >= MAX_LEVEL and not active.get("completed_at"):
         active["completed_at"] = datetime.now(timezone.utc).isoformat()
-        already = {p["species_id"] for p in state["pokedex"]}
-        if active["species_id"] not in already:
-            state["pokedex"].append({
-                "species_id": active["species_id"],
-                "name": active["name"],
-                "level": MAX_LEVEL,
-                "source": "trained",
-                "maxed": True,
-                "shiny": bool(active.get("shiny")),
-                "completed_at": active["completed_at"],
-            })
+        file_in_pc(state, active, "trained")
         events.append({"type": "caught", "who": active["name"],
                        "species_id": active["species_id"],
                        "at": active["completed_at"]})
@@ -650,6 +781,48 @@ def _with_option_sprites(pending):
             sprites = ensure_sprites(option["species_id"], kinds=("artwork",))
         option["sprites"] = sprites
     return pending
+
+
+def _party_view(state):
+    """The team as the panel renders it: the one being trained, then the bench.
+
+    Nothing is recomputed for a benched Pokemon — its level and XP are read
+    straight off the record it was parked with, which is exactly why putting one
+    down costs nothing and picking it up returns it unchanged.
+    """
+    curves = {}
+
+    def view(member, is_active):
+        shiny = bool(member.get("shiny"))
+        # Gen-5 animated sprites stop at 649, so a branch reached past it —
+        # Sylveon is 700 — has none and would render as an empty box. Falling
+        # back to the artwork also stops the missing file being re-requested on
+        # every scan.
+        sprites = ensure_sprites(member["species_id"], kinds=("animated",), shiny=shiny)
+        if not sprites.get("animated"):
+            sprites = ensure_sprites(member["species_id"], kinds=("artwork",), shiny=shiny)
+
+        rate = member["growth_rate"]
+        if rate not in curves:
+            curves[rate] = xp_curve(rate)
+        curve = curves[rate]
+        at_level = curve.get(member["level"], 0)
+        at_next = curve.get(member["level"] + 1)
+        if at_next and at_next > at_level:
+            pct = int(100 * (member["xp"] - at_level) / (at_next - at_level))
+        else:
+            pct = 100
+        return {
+            "species_id": member["species_id"],
+            "name": member["name"],
+            "level": member["level"],
+            "pct": max(0, min(100, pct)),
+            "shiny": shiny,
+            "active": is_active,
+            "sprites": sprites,
+        }
+
+    return [view(state["active"], True)] + [view(m, False) for m in bench(state)]
 
 
 def update_display(state):
@@ -691,7 +864,9 @@ def update_display(state):
         "types": types,
         "emoji": TYPE_EMOJI.get(types[0], "✨") if types else "✨",
         "today_xp": state["daily"].get(today, 0),
-        "caught": len(state["pokedex"]),
+        # Deposited Pokemon are parked, not collected, so they are left out of
+        # the count even though they sit in the same list.
+        "caught": sum(1 for p in state["pokedex"] if p.get("source") != "stored"),
         "commits": state["totals"].get("commits", 0),
         # Rewards from new projects, waiting for a species to be picked.
         "unclaimed": state.get("unclaimed", 0),
@@ -709,6 +884,10 @@ def update_display(state):
         # Cached here so the menu bar app can play it on open without paying
         # the cost of spawning Python.
         "cry": ensure_cry(active["species_id"]),
+        # The whole team, so the panel renders the rotation without a second
+        # read of the state file.
+        "party": _party_view(state),
+        "party_size": PARTY_SIZE,
     }
 
     # Flat line for the statusline, read with bash's `read` builtin so no
@@ -776,7 +955,12 @@ def candidates(state):
         except Exception:
             continue
 
-    available = [f for f in base_forms() if f["species_id"] not in caught_bases]
+    # Chains already on the team are out too: the grid offers what can be
+    # started, and one that is being trained — active or benched — cannot be
+    # started a second time.
+    on_team = training_bases(state)
+    available = [f for f in base_forms()
+                 if f["species_id"] not in caught_bases and f["species_id"] not in on_team]
 
     # Only the small sprite: the grid never shows the 475px artwork, and
     # fetching both is what made an early version crawl. Parallel for the same
@@ -898,27 +1082,227 @@ def main():
             print(f"{active['name'].capitalize()} is level {active['level']}. "
                   f"Retiring needs level {MIN_RETIRE_LEVEL}.")
             return 1
-        if len(sys.argv) < 3:
+        # Retiring frees a slot and whoever is next on the bench takes over, so
+        # naming the species to train next is only needed with an empty bench.
+        if len(sys.argv) < 3 and not bench(state):
             print("Name the species to train next: retire <species_id>")
             return 1
 
-        # Reaching 100 already files it, so avoid a duplicate entry.
-        if not any(p["species_id"] == active["species_id"] for p in state["pokedex"]):
-            state["pokedex"].append({
-                "species_id": active["species_id"],
-                "name": active["name"],
-                "level": active["level"],
-                "source": "trained",
-                "maxed": active["level"] >= MAX_LEVEL,
-                "shiny": bool(active.get("shiny")),
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            })
+        # The successor gets the same guards as `party`, which the panel applies
+        # by filtering the grid but the command has to check for itself. Without
+        # this the chain being retired could be started again in the same breath
+        # and end up in the PC and on the team at once.
+        if len(sys.argv) >= 3:
+            successor = evolution_line(int(sys.argv[2]))[0]
+            if successor["species_id"] in training_bases(state):
+                print(f"{successor['name'].capitalize()} is already on the team.")
+                return 1
+            if any(entry_base(p) == successor["species_id"] for p in state["pokedex"]):
+                print(f"{successor['name'].capitalize()}'s chain is in the PC. "
+                      f"Bring it back out with: withdraw <species_id>")
+                return 1
+
+        # Reaching 100 already filed it, in which case this replaces that entry
+        # rather than adding a second one for the same chain.
+        file_in_pc(state, active, "trained")
         retired = f"{active['name']} Lv.{active['level']}"
 
-        ensure_active(state, species_id=int(sys.argv[2]))
+        if len(sys.argv) >= 3:
+            ensure_active(state, species_id=int(sys.argv[2]))
+        else:
+            state["active"] = bench(state).pop(0)
         update_display(state)
         save_state(state)
         print(f"Retired {retired}. Now training {state['active']['name']}.")
+
+    elif command == "party":
+        # Adds a species to the team and starts training it right away. The one
+        # being trained is benched, not discarded: it keeps its XP, its level and
+        # the branches it already took, and comes back exactly as it was left.
+        state = load_state()
+        if len(sys.argv) < 3:
+            members = ", ".join(f"{m['name']} Lv.{m['level']}"
+                                for m in ([state["active"]] if state.get("active") else [])
+                                + bench(state))
+            print(f"Team ({party_slots_used(state)}/{PARTY_SIZE}): {members or 'empty'}")
+            print("Name the species to add: party <species_id>")
+            return 1
+
+        if party_slots_used(state) >= PARTY_SIZE:
+            print(f"The team is full ({PARTY_SIZE}). Retire one to make room.")
+            return 1
+
+        # Training always starts at the base of the chain, so membership is
+        # compared there too: asking for Pikachu when Pichu is already benched
+        # is the same chain twice.
+        base = evolution_line(int(sys.argv[2]))[0]
+        if base["species_id"] in training_bases(state):
+            print(f"{base['name'].capitalize()} is already on the team.")
+            return 1
+        caught_bases = set()
+        for entry in state.get("pokedex", []):
+            try:
+                caught_bases.add(evolution_line(entry["species_id"])[0]["species_id"])
+            except Exception:
+                continue
+        if base["species_id"] in caught_bases:
+            print(f"{base['name'].capitalize()}'s chain is in storage. "
+                  f"Bring it back out with: withdraw <species_id>")
+            return 1
+
+        if state.get("active"):
+            bench(state).append(state["active"])
+        ensure_active(state, species_id=base["species_id"])
+        update_display(state)
+        save_state(state)
+        new = state["active"]
+        print(f"Added {new['name']} to the team "
+              f"({party_slots_used(state)}/{PARTY_SIZE}). Now training it.")
+
+    elif command == "switch":
+        # Rotates the team: the Pokemon being trained goes to the back of the
+        # bench and the one named takes over. No XP moves and nothing is filed,
+        # which is the whole point — this is putting one down, not finishing it.
+        state = load_state()
+        benched = bench(state)
+        if len(sys.argv) < 3 or not benched:
+            if not benched:
+                print("Nothing on the bench. Add one with: party <species_id>")
+            else:
+                names = ", ".join(f"{m['name']} Lv.{m['level']} ({m['species_id']})"
+                                  for m in benched)
+                print(f"Name who takes over: switch <species_id>. On the bench: {names}")
+            return 1
+
+        wanted = int(sys.argv[2])
+        # Matched on either id: the panel sends the current form, while a person
+        # typing the command is likelier to reach for the chain they picked.
+        index = next((i for i, m in enumerate(benched)
+                      if wanted in (m["species_id"], m.get("base_species_id"))), None)
+        if index is None:
+            names = ", ".join(f"{m['name']} ({m['species_id']})" for m in benched)
+            print(f"{wanted} is not on the bench. Choose from: {names}")
+            return 1
+
+        incoming = benched.pop(index)
+        outgoing = state.get("active")
+        if outgoing:
+            benched.append(outgoing)
+        state["active"] = incoming
+        update_display(state)
+        save_state(state)
+        if outgoing:
+            print(f"Benched {outgoing['name']} Lv.{outgoing['level']}. "
+                  f"Now training {incoming['name']} Lv.{incoming['level']}.")
+        else:
+            print(f"Now training {incoming['name']} Lv.{incoming['level']}.")
+
+    elif command == "withdraw":
+        # Takes a stored Pokemon back out and resumes training it where it left
+        # off. Storage is a PC, not a registry: the entry leaves it while the
+        # Pokemon is on the team and returns on the next retirement, at whatever
+        # level it reached by then. One entry per chain still holds, so nothing
+        # can be duplicated by cycling a Pokemon in and out.
+        state = load_state()
+        stored = state.get("pokedex", [])
+        if len(sys.argv) < 3:
+            names = ", ".join(f"{p['name']} Lv.{p['level']} ({p['species_id']})"
+                              for p in stored)
+            print(f"Name who comes out: withdraw <species_id>. In storage: {names or 'nothing'}")
+            return 1
+
+        wanted = int(sys.argv[2])
+        # Either form identifies it, as with `switch` and `deposit`. The panel
+        # passes the entry's own species, but an entry filed at level 100 keeps
+        # the form it was filed as until it is filed again, so the chain has to
+        # match too.
+        index = next((i for i, p in enumerate(stored)
+                      if wanted in (p["species_id"], entry_base(p))), None)
+        if index is None:
+            print(f"{wanted} is not in the PC.")
+            return 1
+
+        if party_slots_used(state) >= PARTY_SIZE:
+            print(f"The team is full ({PARTY_SIZE}). Retire one to make room.")
+            return 1
+
+        record = record_from_entry(stored[index])
+        # Remembered so putting it back does not demote what it had already
+        # earned: a Lv.100 badge or a project award would otherwise come back as
+        # a plain deposit and drop out of the caught count for good.
+        record["filed_source"] = stored[index].get("source", "trained")
+        # A Pokemon that reached 100 is filed while still being trained, so it
+        # can be in storage and on the team at once. Withdrawing it then would
+        # clone it.
+        if record["base_species_id"] in training_bases(state):
+            print(f"{record['name'].capitalize()} is already on the team.")
+            return 1
+
+        stored.pop(index)
+        if state.get("active"):
+            bench(state).append(state["active"])
+        state["active"] = record
+        # Recomputes the level from the restored XP and re-checks whether the
+        # form it comes back as already qualifies for the next stage.
+        apply_xp(state, 0)
+        update_display(state)
+        save_state(state)
+        print(f"{record['name'].capitalize()} Lv.{record['level']} is out of storage "
+              f"and training ({party_slots_used(state)}/{PARTY_SIZE}).")
+
+    elif command == "deposit":
+        # Puts a team member in the PC to free a slot, at whatever level it is.
+        #
+        # MIN_RETIRE_LEVEL is deliberately not checked here. The floor exists so
+        # that a collection entry means something, and depositing does not make
+        # one: the entry is marked `stored` rather than `trained` and is left out
+        # of the caught count. Without this the team could be locked for days by
+        # a mis-tap, since freeing a slot otherwise needs level 40.
+        state = load_state()
+        active = state.get("active")
+        benched = bench(state)
+        if len(sys.argv) < 3:
+            members = ", ".join(f"{m['name']} Lv.{m['level']} ({m['species_id']})"
+                                for m in ([active] if active else []) + benched)
+            print(f"Name who goes to the PC: deposit <species_id>. Team: {members or 'empty'}")
+            return 1
+
+        wanted = int(sys.argv[2])
+        from_active = bool(active) and wanted in (active["species_id"],
+                                                  active.get("base_species_id"))
+        index = next((i for i, m in enumerate(benched)
+                      if wanted in (m["species_id"], m.get("base_species_id"))), None)
+        if not from_active and index is None:
+            print(f"{wanted} is not on the team.")
+            return 1
+
+        # Depositing the one being trained hands training to the bench, because
+        # the panel has no state for having no active Pokemon.
+        if from_active and not benched:
+            print(f"{active['name'].capitalize()} is the only one on the team. "
+                  f"Add another before putting it away.")
+            return 1
+
+        going = active if from_active else benched.pop(index)
+
+        # "stored" only ever applies to a chain that never earned its place.
+        # One that was trained to the floor, maxed out or awarded keeps that,
+        # whether it is coming back from a withdrawal or was filed at level 100
+        # and is still on the team.
+        base = going.get("base_species_id")
+        existing = next((p for p in state["pokedex"] if entry_base(p) == base), None)
+        source = (going.get("filed_source")
+                  or (existing or {}).get("source")
+                  or "stored")
+        file_in_pc(state, going, source)
+
+        if from_active:
+            state["active"] = benched.pop(0)
+        update_display(state)
+        save_state(state)
+        print(f"{going['name'].capitalize()} Lv.{going['level']} is in the PC "
+              f"({party_slots_used(state)}/{PARTY_SIZE}). "
+              f"Now training {state['active']['name']}.")
 
     elif command == "claim":
         # Spends a reward earned by starting a new project. The Pokemon goes
