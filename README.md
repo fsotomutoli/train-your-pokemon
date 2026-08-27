@@ -6,7 +6,7 @@ earn XP. Retire it whenever you like and it goes into Bill's PC at the level it
 reached, or push it to 100 for the badge — the pace of the collection is yours.
 Nothing stored there is final: pull one back out and keep raising it.
 
-<img src="docs/img/panel.png" alt="Charizard at level 72 in the macOS menu bar, with the panel open showing its type, XP bar, a team of three and Bill's PC" width="311">
+<img src="docs/img/panel.png" alt="Charizard at level 72 in the macOS menu bar, with the panel open showing its type, XP bar, a team of three, a Pokedex at 5 of 649 and Bill's PC" width="320">
 
 ```
 statusline  🌿 main  |  🤖 Opus 5 [high]  |  🔥 Charizard Lv.82 [████████░░] 84%
