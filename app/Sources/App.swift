@@ -22,6 +22,21 @@ struct PendingEvolution: Decodable {
     var options: [EvolutionOption]
 }
 
+/// One Pokemon on the team. Only the active one earns XP; the rest are frozen
+/// at the level they were benched at.
+struct PartyMember: Decodable, Identifiable {
+    var species_id: Int
+    var name: String
+    var level: Int
+    var pct: Int
+    var shiny: Bool?
+    var active: Bool
+    var sprites: [String: String]?
+    var id: Int { species_id }
+
+    var spritePath: String? { sprites?["animated"] ?? sprites?["artwork"] }
+}
+
 struct Display: Decodable {
     var name: String
     var level: Int
@@ -42,6 +57,15 @@ struct Display: Decodable {
     var sprites: [String: String]
     var cry: String?
     var pending_evolution: PendingEvolution?
+    /// Wrapped so a single malformed member degrades to one missing row instead
+    /// of failing the whole Display and blanking the menu bar.
+    var party: [Lossy<PartyMember>]?
+    var party_size: Int?
+    /// Everything in the PC, against `caught` which counts only finished stints.
+    var stored: Int?
+
+    var partyMembers: [PartyMember] { (party ?? []).compactMap(\.value) }
+    var bench: [PartyMember] { partyMembers.filter { !$0.active } }
 }
 
 struct PokedexEntry: Decodable, Identifiable {
@@ -61,6 +85,10 @@ struct PokedexEntry: Decodable, Identifiable {
         if source == "project" { return mark + "Obtenido" }
         return mark + (maxed == true ? "★ Lv.100" : "Lv.\(level)")
     }
+
+    /// Put away rather than finished: deposited below the retirement floor, so
+    /// it sits in the PC without counting towards the collection.
+    var isStored: Bool { source == "stored" }
 }
 
 struct Candidate: Decodable, Identifiable {
@@ -138,7 +166,14 @@ struct AnimatedSprite: NSViewRepresentable {
 // MARK: - Engine bridge
 
 enum PanelRoute {
-    case active, pokedex, picker, evolution
+    case active, pokedex, picker, evolution, party
+}
+
+/// What the shared candidate grid is being opened for. An enum rather than a
+/// flag per case: the three are mutually exclusive and a stray combination of
+/// booleans would silently pick the wrong action.
+enum PickerPurpose {
+    case claim, retire, add
 }
 
 @MainActor
@@ -209,7 +244,7 @@ final class Trainer: ObservableObject {
                 guard let who = event.who else { continue }
                 Notifier.post(title: "¡Nivel 100!",
                               subtitle: who.capitalized,
-                              body: "\(who.capitalized) llegó al máximo y entró a tu Pokédex. Ya puedes entrenar a otro.")
+                              body: "\(who.capitalized) llegó al máximo y quedó guardado en el PC. Ya puedes entrenar a otro.")
                 playCry(speciesID: event.species_id)
 
             default:
@@ -263,7 +298,70 @@ final class Trainer: ObservableObject {
         }
     }
 
-    /// Spends a project reward on a species, which goes straight to the Pokedex.
+    /// Files the current Pokemon and hands training to the next one on the
+    /// bench, so retiring shrinks the team instead of replacing a member.
+    func retireAndPromote() {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["retire"])
+            Self.runEngine(["candidates"])
+            await MainActor.run {
+                self.load()
+                self.playCry()
+            }
+        }
+    }
+
+    /// Benches the current Pokemon and picks up another from the team. Nothing
+    /// is filed and no XP moves — this is putting one down, not finishing it.
+    func switchTo(_ speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["switch", String(speciesID)])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
+    /// Adds a species to the team and starts training it, benching the current
+    /// one. Refused by the engine once the six slots are taken.
+    func addToParty(_ speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["party", String(speciesID)])
+            Self.runEngine(["candidates"])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
+    /// Puts a team member in the PC at whatever level it is, which is the only
+    /// way to free a slot below the retirement floor. Nothing is lost: the entry
+    /// is marked as stored and can be taken back out.
+    func deposit(_ speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["deposit", String(speciesID)])
+            Self.runEngine(["candidates"])
+            await MainActor.run { self.load() }
+        }
+    }
+
+    /// Takes a stored Pokemon back out and resumes training it. The entry
+    /// leaves storage while it is on the team and returns on the next
+    /// retirement, at whatever level it reached by then.
+    func withdraw(_ speciesID: Int) {
+        Task.detached(priority: .userInitiated) {
+            Self.runEngine(["withdraw", String(speciesID)])
+            Self.runEngine(["candidates"])
+            await MainActor.run {
+                self.load()
+                self.playCry(speciesID: speciesID)
+            }
+        }
+    }
+
+    /// Spends a project reward on a species, which goes straight to storage.
     func claim(_ speciesID: Int) {
         Task.detached(priority: .userInitiated) {
             Self.runEngine(["claim", String(speciesID)])
@@ -294,19 +392,6 @@ final class Trainer: ObservableObject {
             await MainActor.run {
                 self.load()
                 self.isLoadingCandidates = false
-            }
-        }
-    }
-
-    /// Starts training a new species. Only offered at level 100, where the
-    /// current Pokemon is already stored in the Pokedex and nothing is lost.
-    func swap(to speciesID: Int) {
-        Task.detached(priority: .userInitiated) {
-            Self.runEngine(["choose", String(speciesID)])
-            Self.runEngine(["candidates"])
-            await MainActor.run {
-                self.load()
-                self.playCry()
             }
         }
     }
@@ -347,13 +432,19 @@ struct XPBar: View {
 struct TrainerPanel: View {
     @ObservedObject var trainer: Trainer
     @State private var route: PanelRoute = .active
-    /// The picker is shared: it either swaps who is being trained, or spends a
-    /// project reward. This says which.
-    @State private var claiming = false
+    /// The candidate grid is shared by three flows; this says which one opened it.
+    @State private var picking: PickerPurpose = .add
     /// Form the animation is currently morphing into, once chosen.
     @State private var evolvingTo: EvolutionOption?
-    /// The picker is retiring the current Pokemon rather than claiming a reward.
-    @State private var retiring = false
+    /// Stored Pokemon awaiting confirmation to come back out. The grid cells are
+    /// small and sit four to a row, so a tap asks before it acts.
+    @State private var withdrawing: PokedexEntry?
+    /// The PC is reachable from the main view and from the team, so "back" has
+    /// to return where it was opened from.
+    @State private var storageReturn: PanelRoute = .active
+    /// Team member awaiting confirmation to go to the PC. Offered only with a
+    /// full team, which is the one situation where a slot has to be freed.
+    @State private var depositing: PartyMember?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -362,6 +453,7 @@ struct TrainerPanel: View {
             case .pokedex: pokedexView
             case .picker: pickerView
             case .evolution: evolutionView
+            case .party: partyView
             }
         }
         .frame(width: 280)
@@ -447,7 +539,7 @@ struct TrainerPanel: View {
             if let unclaimed = display.unclaimed, unclaimed > 0 {
                 Button {
                     trainer.loadCandidates()
-                    claiming = true
+                    picking = .claim
                     route = .picker
                 } label: {
                     Label("\(unclaimed) Pokémon por reclamar", systemImage: "gift.fill")
@@ -460,24 +552,42 @@ struct TrainerPanel: View {
             Divider().padding(.vertical, 10)
 
             Button {
-                route = .pokedex
+                route = .party
             } label: {
-                Label("Ver Pokédex (\(trainer.state.pokedex.count))", systemImage: "book.fill")
+                Label("Equipo (\(display.partyMembers.count)/\(display.party_size ?? 6))",
+                      systemImage: "person.2.fill")
                     .frame(maxWidth: .infinity)
             }
+
+            Button {
+                withdrawing = nil
+                storageReturn = .active
+                route = .pokedex
+            } label: {
+                Label("PC de Bill (\(trainer.state.pokedex.count))", systemImage: "desktopcomputer")
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(.top, 6)
 
             // Retiring files the Pokemon at whatever level it reached and
             // starts the next one. The floor exists so an entry still means
             // something; the engine enforces it independently.
             if display.can_retire == true {
+                // With someone on the bench, retiring hands training over to
+                // them and the team shrinks by one — which is also the only way
+                // to free a slot. With an empty bench there is nobody to
+                // promote, so a new species has to be picked.
+                let next = display.bench.first
                 Button {
-                    trainer.loadCandidates()
-                    retiring = true
-                    route = .picker
+                    if next != nil {
+                        trainer.retireAndPromote()
+                    } else {
+                        trainer.loadCandidates()
+                        picking = .retire
+                        route = .picker
+                    }
                 } label: {
-                    Label(display.level >= 100
-                          ? "Retirar y entrenar otro"
-                          : "Retirar en Lv.\(display.level) y entrenar otro",
+                    Label(retireLabel(display: display, next: next),
                           systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity)
                 }
@@ -506,43 +616,294 @@ struct TrainerPanel: View {
         }
     }
 
-    private var pokedexView: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    /// Names what retiring will actually do, which depends on whether anyone is
+    /// waiting on the bench to take over.
+    private func retireLabel(display: Display, next: PartyMember?) -> String {
+        let at = display.level >= 100 ? "Retirar" : "Retirar en Lv.\(display.level)"
+        guard let next else { return "\(at) y entrenar otro" }
+        return "\(at) y seguir con \(next.name.capitalized)"
+    }
+
+    private var partyView: some View {
+        let display = trainer.state.display
+        let members = display?.partyMembers ?? []
+        let capacity = display?.party_size ?? 6
+
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Pokédex").font(.headline)
+                Text("Equipo").font(.headline)
                 Spacer()
-                Text("\(trainer.state.pokedex.count) capturados")
+                Text("\(members.count)/\(capacity)")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            if trainer.state.pokedex.isEmpty {
-                Text("Todavía no capturas ninguno.\nLlega a nivel 100 para sumar el primero.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.vertical, 20)
-            } else {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
-                    ForEach(trainer.state.pokedex) { entry in
-                        VStack(spacing: 2) {
-                            if let image = Sprites.image(Sprites.spritePath(speciesID: entry.species_id)) {
-                                Image(nsImage: image)
-                                    .resizable().interpolation(.none)
-                                    .scaledToFit().frame(height: 32)
+            Text("Solo el que estás entrenando gana XP. Los demás quedan congelados en su nivel hasta que los retomes.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            let full = members.count >= capacity
+
+            if let member = depositing {
+                depositConfirmation(member)
+            }
+
+            VStack(spacing: 6) {
+                ForEach(members) { member in
+                    HStack(spacing: 2) {
+                        Button {
+                            // The active member is already training; tapping it
+                            // would bench and unbench the same Pokemon.
+                            guard !member.active else { return }
+                            trainer.switchTo(member.species_id)
+                            route = .active
+                        } label: {
+                            partyRow(member)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(member.active)
+
+                        // Shown only with a full team. Freeing a slot is the
+                        // only reason to put a Pokemon away, and an always-on
+                        // control here would just be a way to mis-tap.
+                        if full {
+                            Button {
+                                depositing = member
+                            } label: {
+                                Image(systemName: "tray.and.arrow.down.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.secondary.opacity(0.6))
                             }
-                            Text(entry.name.capitalized)
-                                .font(.system(size: 8)).lineLimit(1)
-                            Text(entry.badge)
-                                .font(.system(size: 8)).foregroundStyle(.secondary)
+                            .buttonStyle(.plain)
+                            .help("Enviar a \(member.name.capitalized) al PC")
                         }
                     }
                 }
             }
 
-            Button("‹ Volver") { route = .active }
-                .buttonStyle(.borderless)
-                .font(.caption)
+            // Two doors rather than one merged list: the PC holds a handful of
+            // Pokemon and there are 300-odd species that have never been
+            // trained, so mixing them reads as a species catalogue with the
+            // trainer's own Pokemon as a footnote. Each button names its source.
+            if members.count < capacity {
+                if !withdrawableEntries.isEmpty {
+                    Button {
+                        withdrawing = nil
+                        storageReturn = .party
+                        route = .pokedex
+                    } label: {
+                        Label("Sacar del PC (\(withdrawableEntries.count))",
+                              systemImage: "tray.and.arrow.up.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+
+                Button {
+                    trainer.loadCandidates()
+                    picking = .add
+                    route = .picker
+                } label: {
+                    Label("Empezar una especie nueva", systemImage: "plus.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                Text("Equipo completo. Envía a uno al PC para hacer espacio — vuelve con su nivel cuando lo saques.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button("‹ Volver") {
+                depositing = nil
+                route = .active
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
         }
+    }
+
+    /// The floor that gates retiring does not apply here, because depositing is
+    /// not a way into the collection: the entry is marked as stored and left out
+    /// of the caught count, so it frees the slot without cheapening anything.
+    private func depositConfirmation(_ member: PartyMember) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("¿Enviar a \(member.name.capitalized) Lv.\(member.level) al PC?")
+                .font(.caption.bold())
+                .fixedSize(horizontal: false, vertical: true)
+            Text(member.active
+                 ? "Libera un cupo y pasa a entrenar el primero de la banca. Queda guardado con su nivel y no cuenta como capturado."
+                 : "Libera un cupo. Queda guardado con su nivel y no cuenta como capturado.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Enviar al PC") {
+                    trainer.deposit(member.species_id)
+                    depositing = nil
+                }
+                .buttonStyle(.borderedProminent)
+                Button("Cancelar") { depositing = nil }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func partyRow(_ member: PartyMember) -> some View {
+        HStack(spacing: 8) {
+            if let image = Sprites.image(member.spritePath) {
+                Image(nsImage: image)
+                    .resizable().interpolation(.none)
+                    .scaledToFit().frame(width: 32, height: 32)
+            } else {
+                Color.clear.frame(width: 32, height: 32)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    Text(member.shiny == true
+                         ? "✨ \(member.name.capitalized)"
+                         : member.name.capitalized)
+                        .font(.caption.bold())
+                        .foregroundStyle(member.shiny == true ? .yellow : .primary)
+                    Spacer()
+                    Text("Lv.\(member.level)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                XPBar(pct: member.pct)
+            }
+
+            // Marks who is earning XP, so the row that cannot be tapped also
+            // explains why.
+            Image(systemName: member.active ? "bolt.fill" : "pause.circle")
+                .font(.caption)
+                // Both branches typed as Color on purpose: `.tertiary` is a
+                // different ShapeStyle, and a ternary of two styles will not
+                // typecheck.
+                .foregroundStyle(member.active ? Color.yellow : Color.secondary.opacity(0.6))
+        }
+        .padding(6)
+        .background(member.active ? Color.primary.opacity(0.08) : .clear,
+                    in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+    }
+
+    private var pokedexView: some View {
+        let display = trainer.state.display
+        let members = display?.partyMembers ?? []
+        let capacity = display?.party_size ?? 6
+        let roomLeft = members.count < capacity
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("PC de Bill").font(.headline)
+                Spacer()
+                Text(storageCountLabel)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if trainer.state.pokedex.isEmpty {
+                Text("El PC está vacío.\nRetira al que estás entrenando para guardar el primero.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 20)
+            } else {
+                // Confirms before acting: the cells are small, four to a row,
+                // and a mis-tap would put a stored Pokemon back into training.
+                if let entry = withdrawing {
+                    withdrawConfirmation(entry, roomLeft: roomLeft, capacity: capacity)
+                } else {
+                    Text("Toca a uno para sacarlo y seguir entrenándolo. Vuelve al PC cuando lo retires.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ScrollView {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
+                        ForEach(trainer.state.pokedex) { entry in
+                            // A Pokemon that reached 100 is stored while still
+                            // being trained, so it can be in both places at once.
+                            let onTeam = members.contains { $0.species_id == entry.species_id }
+                            Button {
+                                withdrawing = entry
+                            } label: {
+                                VStack(spacing: 2) {
+                                    if let image = Sprites.image(Sprites.spritePath(speciesID: entry.species_id)) {
+                                        Image(nsImage: image)
+                                            .resizable().interpolation(.none)
+                                            .scaledToFit().frame(height: 32)
+                                            // Dimmed when already on the team,
+                                            // and again when it was only parked
+                                            // rather than trained to the floor.
+                                            .opacity(onTeam ? 0.4 : (entry.isStored ? 0.75 : 1))
+                                    }
+                                    Text(entry.name.capitalized)
+                                        .font(.system(size: 8)).lineLimit(1)
+                                    Text(onTeam ? "en el equipo" : entry.badge)
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(entry.isStored ? Color.secondary.opacity(0.7)
+                                                                        : Color.secondary)
+                                }
+                                .padding(3)
+                                .background(withdrawing?.species_id == entry.species_id
+                                            ? Color.accentColor.opacity(0.20) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 5))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(onTeam)
+                        }
+                    }
+                }
+                .frame(maxHeight: 190)
+            }
+
+            Button("‹ Volver") {
+                withdrawing = nil
+                route = storageReturn
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+    }
+
+    private func withdrawConfirmation(_ entry: PokedexEntry,
+                                      roomLeft: Bool,
+                                      capacity: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if roomLeft {
+                Text("¿Sacar a \(entry.name.capitalized) \(entry.badge) del PC?")
+                    .font(.caption.bold())
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Pasa a ser el que entrenas y sale del PC hasta que lo retires.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Sacar") {
+                        trainer.withdraw(entry.species_id)
+                        withdrawing = nil
+                        route = .active
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Cancelar") { withdrawing = nil }
+                        .buttonStyle(.bordered)
+                }
+            } else {
+                Text("Equipo completo (\(capacity)). Retira a uno para hacerle espacio a \(entry.name.capitalized).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Cancelar") { withdrawing = nil }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
     }
 
     @ViewBuilder
@@ -615,17 +976,16 @@ struct TrainerPanel: View {
     private var pickerView: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(claiming ? "Reclamar Pokémon" : "Elegir Pokémon").font(.headline)
+                Text(pickerTitle).font(.headline)
                 Spacer()
                 Text("\(trainer.state.candidates.count) disponibles")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Text(claiming
-                 ? "Entra directo a tu Pokédex, marcado como obtenido."
-                 : "Empieza en nivel 1 desde la base de su línea evolutiva.")
+            Text(pickerSubtitle)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             if trainer.isLoadingCandidates && trainer.state.candidates.isEmpty {
                 HStack {
@@ -635,42 +995,96 @@ struct TrainerPanel: View {
                 .padding(.vertical, 20)
             } else {
                 ScrollView {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
-                        ForEach(trainer.state.candidates) { candidate in
-                            Button {
-                                if claiming {
-                                    trainer.claim(candidate.species_id)
-                                    claiming = false
-                                } else if retiring {
-                                    trainer.retire(startingWith: candidate.species_id)
-                                    retiring = false
-                                } else {
-                                    trainer.swap(to: candidate.species_id)
-                                }
-                                route = .active
-                            } label: {
-                                VStack(spacing: 2) {
-                                    if let image = Sprites.image(Sprites.spritePath(speciesID: candidate.species_id)) {
-                                        Image(nsImage: image)
-                                            .resizable().interpolation(.none)
-                                            .scaledToFit().frame(height: 30)
-                                    } else {
-                                        Color.clear.frame(height: 30)
-                                    }
-                                    Text(candidate.name.capitalized)
-                                        .font(.system(size: 8)).lineLimit(1)
-                                }
-                            }
-                            .buttonStyle(.plain)
+                    spriteGrid(trainer.state.candidates) { candidate in
+                        switch picking {
+                        case .claim:
+                            trainer.claim(candidate.species_id)
+                        case .retire:
+                            trainer.retire(startingWith: candidate.species_id)
+                        case .add:
+                            trainer.addToParty(candidate.species_id)
                         }
+                        route = .active
+                    } cell: { candidate in
+                        (candidate.species_id, candidate.name, nil)
                     }
                 }
                 .frame(maxHeight: 220)
             }
 
-            Button("‹ Volver") { route = .active }
-                .buttonStyle(.borderless)
-                .font(.caption)
+            Button("‹ Volver") { route = picking == .add ? .party : .active }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+    }
+
+    /// The PC holds everything; only finished stints count as collected, so both
+    /// numbers are shown when they differ.
+    private var storageCountLabel: String {
+        let total = trainer.state.pokedex.count
+        let caught = trainer.state.pokedex.filter { !$0.isStored }.count
+        return caught == total ? "\(total) guardados"
+                               : "\(total) guardados · \(caught) capturados"
+    }
+
+    /// Stored Pokemon that could come out: everything in the PC except one that
+    /// reached 100 and is therefore stored while still on the team.
+    private var withdrawableEntries: [PokedexEntry] {
+        let onTeam = Set((trainer.state.display?.partyMembers ?? []).map(\.species_id))
+        return trainer.state.pokedex.filter { !onTeam.contains($0.species_id) }
+    }
+
+    /// The four-across sprite grid both sections use. `cell` supplies what to
+    /// draw for an item; `action` what tapping it does.
+    private func spriteGrid<Item: Identifiable>(
+        _ items: [Item],
+        action: @escaping (Item) -> Void,
+        cell: @escaping (Item) -> (Int, String, String?)
+    ) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 10) {
+            ForEach(items) { item in
+                let (speciesID, name, caption) = cell(item)
+                Button {
+                    action(item)
+                } label: {
+                    VStack(spacing: 2) {
+                        if let image = Sprites.image(Sprites.spritePath(speciesID: speciesID)) {
+                            Image(nsImage: image)
+                                .resizable().interpolation(.none)
+                                .scaledToFit().frame(height: 30)
+                        } else {
+                            Color.clear.frame(height: 30)
+                        }
+                        Text(name.capitalized)
+                            .font(.system(size: 8)).lineLimit(1)
+                        if let caption {
+                            Text(caption)
+                                .font(.system(size: 8)).foregroundStyle(.secondary)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var pickerTitle: String {
+        switch picking {
+        case .claim: return "Reclamar Pokémon"
+        case .retire: return "Elegir Pokémon"
+        case .add: return "Especie nueva"
+        }
+    }
+
+    private var pickerSubtitle: String {
+        switch picking {
+        case .claim:
+            return "Entra directo al PC de Bill, marcado como obtenido."
+        case .retire:
+            return "Empieza en nivel 1 desde la base de su línea evolutiva."
+        case .add:
+            return "Nunca entrenada: empieza en nivel 1 desde la base de su línea. Pasa a ser la que entrenas y el actual va a la banca."
         }
     }
 }

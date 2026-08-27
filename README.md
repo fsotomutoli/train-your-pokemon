@@ -2,8 +2,9 @@
 
 Turns your Claude Code work into a Pokémon that levels up and evolves, shown in
 the macOS menu bar and in the Claude Code status line. Tokens and commits both
-earn XP. Retire it whenever you like and it joins your Pokédex at the level it
+earn XP. Retire it whenever you like and it goes into Bill's PC at the level it
 reached, or push it to 100 for the badge — the pace of the collection is yours.
+Nothing stored there is final: pull one back out and keep raising it.
 
 <img src="docs/img/panel.png" alt="Charizard at level 82 in the macOS menu bar, with the panel open showing its type, XP bar and Pokedex button" width="330">
 
@@ -44,9 +45,9 @@ Two sources feed the same Pokémon, split by how often each happens.
 | New project | a few a year | a Pokémon of your choice |
 
 Commits grant XP rather than Pokémon on purpose. At nine a day, awarding a
-Pokémon per commit would bury the Pokédex under level-1 entries nobody trained
-and drown the ones actually raised — the Pokédex has to stay a record of what
-was trained, so training is the only route into it.
+Pokémon per commit would bury the PC under level-1 entries nobody trained and
+drown the ones actually raised — the collection has to stay a record of what was
+trained, so training is the only route into it.
 
 Starting a brand new project does grant one, because it happens rarely enough to
 stay meaningful. Those are stored with their source and shown as *Obtenido*
@@ -57,9 +58,9 @@ needs a hook and every project counts automatically.
 
 ## Setting your own pace
 
-Retiring files the active Pokémon at whatever level it reached and starts the
+Retiring stores the active Pokémon at whatever level it reached and starts the
 next one. Level 100 is a badge, not a requirement — in the games you fill the
-Pokédex by catching, and nobody maxes 151 Pokémon.
+collection by catching, and nobody maxes 151 Pokémon.
 
 | Retire at | Each takes | Per year | 328 species in |
 |---|---|---|---|
@@ -73,6 +74,51 @@ chains, **98% have fully evolved by level 40** and the median last evolution is
 34.5. Anything above that is watching a number grow with no new form to see. A
 floor is needed at all because without one the whole roster could be retired at
 level 1 in an afternoon.
+
+### A team of six
+
+Retiring is final, so it is the wrong tool for losing interest in a Pokémon
+halfway up. The team is the other one: up to **six at a time**, of which only the
+one being trained earns XP. The rest sit benched, frozen at exactly the level and
+XP they were parked with, and come back unchanged whenever you pick them up
+again.
+
+Nothing is duplicated or lost by rotating — the XP a day produces is the same, it
+just goes wherever you pointed it. What the six slots buy is the pressure that
+keeps the team from becoming storage: filling the last slot means retiring
+someone first, and retiring still needs level 40. Without a limit a dozen
+Pokémon would sit at level 5 forever and the collection would never grow.
+
+Retiring with someone on the bench hands training straight to them instead of
+asking for a new species, which is also how a slot is freed.
+
+With a full team, and only then, any member can be put in the PC at whatever
+level it is. That is the way out of a team filled by accident: freeing a slot
+otherwise needs level 40, so a couple of mis-taps could lock the team for days.
+
+Depositing skips the floor without cheapening it, because it does not make a
+collection entry. A deposited Pokémon is marked *stored* rather than *trained*
+and is left out of the caught count — it is parked, not finished. Take it back
+out, raise it past the floor and retire it, and only then does it count.
+
+### Bill's PC
+
+Retiring is not the end of a Pokémon, only the end of a stint. Stored Pokémon can
+be pulled back out and put on the team, resuming at the level they went in at.
+The entry leaves the PC while it is being trained and returns on the next
+retirement, at whatever level it reached by then — so one chain still yields
+exactly one entry and cycling a Pokémon in and out duplicates nothing.
+
+Entries filed before this existed keep only species, level and shininess, so the
+rest of the record is derived on the way out: the chain from the species, the XP
+from what that level is worth on its curve, and the branch it took from the form
+it was stored as. Partial progress towards the next level was never recorded, so
+it comes back at exactly its level's threshold. Everything stored from now on
+keeps its whole record and returns untouched.
+
+Awarded Pokémon can be trained too. One starts at level 1 marked *Obtenido*, and
+if it is taken out and raised, retiring it files it as trained at the level it
+actually reached.
 
 ### What you can train
 
@@ -89,11 +135,11 @@ PokéAPI itself carries 1025 species across 541 chains.
 
 Rolled once when a species starts being trained or is claimed, never on
 evolution — shininess is inherited, so a shiny Charmander yields a shiny
-Charizard. Purely cosmetic, marked with ✨ in the panel and the Pokédex.
+Charizard. Purely cosmetic, marked with ✨ in the panel and the PC.
 
 The odds are **1 in 45**, which lands near four a year at the ~183 encounters
 that retiring at the floor produces. Retire higher and you will see fewer, which
-is the trade rather than a flaw: hunting shinies costs Pokédex quality. The
+is the trade rather than a flaw: hunting shinies costs collection quality. The
 games use 1/8192, which at this cadence means never.
 
 ## The interesting parts
@@ -156,6 +202,11 @@ python3 engine/poketrainer.py scan               # incremental update (~0.1s)
 python3 engine/poketrainer.py backfill           # re-read all history
 python3 engine/poketrainer.py status             # dump state as JSON
 python3 engine/poketrainer.py candidates         # list species you can train
+python3 engine/poketrainer.py party 7            # add #7 to the team and train it
+python3 engine/poketrainer.py switch 95          # bench the current, resume #95
+python3 engine/poketrainer.py withdraw 6         # take #6 out of the PC and train it
+python3 engine/poketrainer.py deposit 152        # park a team member in the PC
+python3 engine/poketrainer.py retire             # file it, promote the bench
 python3 engine/poketrainer.py retire 4           # file the current one, train #4
 python3 engine/poketrainer.py choose 4 --keep-xp # switch, carrying XP over
 python3 engine/poketrainer.py evolve 197         # pick a form on a branching stage
@@ -172,6 +223,7 @@ Pace and rewards live at the top of `engine/poketrainer.py`:
 TOKENS_PER_XP      = 50     # lower = faster levelling
 COMMIT_XP          = 2000   # XP per commit
 MIN_RETIRE_LEVEL   = 40     # lowest level a Pokemon may be retired at
+PARTY_SIZE         = 6      # team slots, the active Pokemon included
 SHINY_CHANCE       = 45     # one in N new Pokemon is shiny
 MAX_SPECIES_ID     = 649    # end of gen V, where animated sprites stop
 FIXED_EVO_LEVEL    = 40     # for evolutions PokeAPI gives no level
