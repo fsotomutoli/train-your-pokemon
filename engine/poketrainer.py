@@ -13,6 +13,7 @@ Usage:
     poketrainer.py switch <id>   # rotate to another member of the team
     poketrainer.py withdraw <id> # take one out of storage and train it again
     poketrainer.py deposit <id>  # put a team member in the PC to free a slot
+    poketrainer.py dex           # rebuild the Pokedex registry and its sprites
 """
 
 import json
@@ -31,6 +32,10 @@ CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 STATE_PATH = CLAUDE_DIR / "pokemon-state.json"
 STATUSLINE_PATH = CLAUDE_DIR / "pokemon-statusline"
+# The Pokedex grid is 649 entries and the panel only reads it when opened, so it
+# lives outside the state file that every scan rewrites and the menu bar reloads
+# every 30 seconds.
+DEX_PATH = CLAUDE_DIR / "pokemon-dex.json"
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 CACHE_DIR = ASSETS_DIR / "cache"
@@ -143,6 +148,10 @@ def empty_state():
         "version": 1,
         "active": None,
         "bench": [],
+        # Species ever owned, keyed by id. The Pokedex registers on acquisition
+        # and never shrinks, which is what separates it from the PC: one records
+        # that you had a species, the other holds the Pokemon itself.
+        "dex": {},
         # Stored Pokemon. The key is the original name and stays for
         # compatibility with existing state files, but this is storage rather
         # than a registry — entries come back out — and the panel calls it
@@ -637,6 +646,88 @@ def record_from_entry(entry):
     return record
 
 
+def register_species(state, species_id, name, shiny=False):
+    """Record a species in the Pokedex. Idempotent.
+
+    The first sighting keeps its date, but shininess is sticky: having owned a
+    shiny one is worth remembering even if the one you hold now is not.
+    """
+    dex = state.setdefault("dex", {})
+    key = str(species_id)
+    entry = dex.get(key)
+    if entry is None:
+        dex[key] = {
+            "name": name,
+            "first_seen": datetime.now(timezone.utc).isoformat(),
+            "shiny": bool(shiny),
+        }
+    else:
+        entry["name"] = name
+        entry["shiny"] = bool(entry.get("shiny")) or bool(shiny)
+    return dex[key]
+
+
+def forms_taken(member):
+    """Every form a Pokemon has actually been, base first.
+
+    A chain is only walked as far as the Pokemon got, and at a branching stage
+    only the option it took counts — picking Umbreon never means having owned a
+    Vaporeon.
+    """
+    line = member.get("line") or []
+    choices = member.get("choices") or {}
+    current = member.get("species_id")
+    forms = []
+
+    for index, stage in enumerate(line):
+        if index == 0:
+            forms.append((stage["species_id"], stage["name"]))
+            if stage["species_id"] == current:
+                break
+            continue
+
+        options = stage.get("options") or []
+        picked = next((o for o in options if o["species_id"] == current), None)
+        if picked is None:
+            chosen_id = choices.get(str(index))
+            if chosen_id is None and len(options) == 1:
+                picked = options[0]
+            else:
+                picked = next((o for o in options if o["species_id"] == chosen_id), None)
+        if picked is None:
+            # A stage it never reached, or a branch with no record of the pick.
+            break
+        forms.append((picked["species_id"], picked["name"]))
+        if picked["species_id"] == current:
+            break
+
+    return forms
+
+
+def reconstruct_dex(state):
+    """Seed the registry from what the trainer holds right now.
+
+    Only current holdings are walked, which is the honest bound: a Pokemon that
+    was trained and is no longer anywhere left no record to recover. Everything
+    still on the team or in the PC contributes every form it passed through.
+    """
+    members = ([state["active"]] if state.get("active") else []) + bench(state)
+    for member in members:
+        shiny = bool(member.get("shiny"))
+        for species_id, name in forms_taken(member):
+            register_species(state, species_id, name, shiny)
+
+    for entry in state.get("pokedex", []):
+        record = entry.get("record")
+        shiny = bool(entry.get("shiny"))
+        if record:
+            for species_id, name in forms_taken(record):
+                register_species(state, species_id, name, shiny)
+        else:
+            # No record to walk: at least the form it was filed as is certain.
+            register_species(state, entry["species_id"], entry["name"], shiny)
+
+
 def bench(state):
     """Team members that are not the one currently earning XP.
 
@@ -681,6 +772,8 @@ def ensure_active(state, species_id=None):
         "line": line,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
+    register_species(state, base["species_id"], base["name"],
+                     state["active"]["shiny"])
     return state["active"]
 
 
@@ -873,6 +966,10 @@ def update_display(state):
         # The trainer sets the pace: retire early for a wider Pokedex, or push
         # to 100 for the badge.
         "can_retire": level >= MIN_RETIRE_LEVEL,
+        # Whether retiring may hand out a new species, or only promote the bench.
+        "can_start_new": active.get("filed_level") is None
+                         or level > active["filed_level"],
+        "filed_level": active.get("filed_level"),
         "retire_level": MIN_RETIRE_LEVEL,
         "next_evo": next_stage["name"] if next_stage else None,
         "next_evo_level": next_stage["min_level"] if next_stage else None,
@@ -888,6 +985,15 @@ def update_display(state):
         # read of the state file.
         "party": _party_view(state),
         "party_size": PARTY_SIZE,
+        # The Pokedex counts species ever owned; `caught` counts what is stored.
+        #
+        # Bounded by the grid's own range: branch evolutions reach past gen V —
+        # Eevee alone offers Sylveon at 700 — and those stay in the registry as
+        # a true record of having owned them, but counting them against a total
+        # of 649 produced headline numbers like "650/649".
+        "dex_registered": sum(1 for key in state.get("dex", {})
+                              if int(key) <= MAX_SPECIES_ID),
+        "dex_total": MAX_SPECIES_ID,
     }
 
     # Flat line for the statusline, read with bash's `read` builtin so no
@@ -984,10 +1090,17 @@ def scan(from_scratch=False):
         keep_choices = previous.get("choices", {})
         keep_pokedex = state.get("pokedex", [])
         keep_unclaimed = state.get("unclaimed", 0)
+        # The bench holds Pokemon with XP already granted and the registry
+        # records species that were genuinely owned — neither is derived from
+        # the transcripts, so replaying them must not wipe either.
+        keep_bench = state.get("bench", [])
+        keep_dex = state.get("dex", {})
 
         state = empty_state()
         state["pokedex"] = keep_pokedex
         state["unclaimed"] = keep_unclaimed
+        state["bench"] = keep_bench
+        state["dex"] = keep_dex
         if keep_species:
             ensure_active(state, species_id=keep_species)
             state["active"]["choices"] = keep_choices
@@ -1014,6 +1127,7 @@ def scan(from_scratch=False):
         # Even with no new tokens the display must refresh: the day rolls over
         # (today_xp resets) and sprites may still be missing.
         ensure_active(state)
+        reconstruct_dex(state)
         update_display(state)
         save_state(state)
         return state, []
@@ -1026,6 +1140,9 @@ def scan(from_scratch=False):
     state["totals"]["xp_all_time"] += gained_xp
 
     events = apply_xp(state, gained_xp, cap_level=BACKFILL_MAX_LEVEL if from_scratch else None)
+    # Cheap: walks the lines already stored on each member, no requests. Keeps
+    # the registry seeded for state files written before it existed.
+    reconstruct_dex(state)
     update_display(state)
     # Notifications are posted by the menu bar app, not here. Going through
     # osascript attributes them to Script Editor, which on this machine has its
@@ -1061,6 +1178,50 @@ def main():
     elif command == "status":
         print(json.dumps(load_state(), indent=2, ensure_ascii=False))
 
+    elif command == "dex":
+        # Rebuilds the registry and writes the grid the panel renders. Kept out
+        # of `scan` because it fetches a sprite for every species in range: a
+        # one-off cost, not something to pay every 30 seconds.
+        # Deliberately does not save: this runs while the menu bar's 30-second
+        # scan may be mid-flight, and a load-modify-write here would roll back
+        # that tick's cursors and XP. Every scan reconstructs the registry
+        # anyway, so persisting it is the scan's job, not this command's.
+        state = load_state()
+        reconstruct_dex(state)
+        dex = state.get("dex", {})
+        started = time.time()
+
+        def dex_entry(species_id):
+            entry = dex.get(str(species_id))
+            shiny = bool(entry and entry.get("shiny"))
+            sprites = ensure_sprites(species_id, kinds=("animated",), shiny=shiny)
+            # A shiny sprite may be missing where the ordinary one is not.
+            if shiny and not sprites.get("animated"):
+                sprites = ensure_sprites(species_id, kinds=("animated",))
+            return {
+                "species_id": species_id,
+                # Unregistered entries stay nameless on purpose: the games show
+                # ????? until you have owned one, and it saves 600-odd lookups.
+                "name": entry["name"] if entry else None,
+                "registered": entry is not None,
+                "shiny": shiny,
+                "sprite": sprites.get("animated"),
+            }
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            entries = list(pool.map(dex_entry, range(1, MAX_SPECIES_ID + 1)))
+
+        payload = {"total": MAX_SPECIES_ID,
+                   "registered": sum(1 for e in entries if e["registered"]),
+                   "entries": entries}
+        tmp = DEX_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, DEX_PATH)
+        missing = sum(1 for e in entries if not e["sprite"])
+        print(f"{payload['registered']}/{payload['total']} registrados "
+              f"en {time.time() - started:.1f}s"
+              + (f" ({missing} sin sprite)" if missing else ""))
+
     elif command == "candidates":
         # Written to the state file so the menu bar app reads it the same way
         # it reads everything else, instead of parsing stdout.
@@ -1092,6 +1253,17 @@ def main():
         # by filtering the grid but the command has to check for itself. Without
         # this the chain being retired could be started again in the same breath
         # and end up in the PC and on the team at once.
+        # Starting a new species is what makes the collection grow, so it costs
+        # progress: a Pokemon that has not gained a level since it was last put
+        # away has achieved nothing to be rewarded for. Promoting the bench is
+        # always available, since that hands out nothing.
+        filed_at = active.get("filed_level")
+        if len(sys.argv) >= 3 and filed_at is not None and active["level"] <= filed_at:
+            print(f"{active['name'].capitalize()} has not gained a level since it went "
+                  f"into the PC at Lv.{filed_at}. Train it further, or retire it by "
+                  f"promoting the bench.")
+            return 1
+
         if len(sys.argv) >= 3:
             successor = evolution_line(int(sys.argv[2]))[0]
             if successor["species_id"] in training_bases(state):
@@ -1231,6 +1403,11 @@ def main():
         # earned: a Lv.100 badge or a project award would otherwise come back as
         # a plain deposit and drop out of the caught count for good.
         record["filed_source"] = stored[index].get("source", "trained")
+        # Retiring hands out a new species, and that is a reward for training.
+        # Without remembering the level it went in at, a Pokemon could be taken
+        # out and filed again unchanged, over and over, each round trip paying
+        # out another Pokemon for no work at all.
+        record["filed_level"] = stored[index].get("level", 0)
         # A Pokemon that reached 100 is filed while still being trained, so it
         # can be in storage and on the team at once. Withdrawing it then would
         # clone it.
@@ -1242,6 +1419,8 @@ def main():
         if state.get("active"):
             bench(state).append(state["active"])
         state["active"] = record
+        for species_id, name in forms_taken(record):
+            register_species(state, species_id, name, bool(record.get("shiny")))
         # Recomputes the level from the restored XP and re-checks whether the
         # form it comes back as already qualifies for the next stage.
         apply_xp(state, 0)
@@ -1319,14 +1498,16 @@ def main():
             print(f"{base['name'].capitalize()} is already in the Pokedex.")
             return 1
 
+        shiny = random.randrange(SHINY_CHANCE) == 0
         state["pokedex"].append({
             "species_id": base["species_id"],
             "name": base["name"],
             "level": 1,
             "source": "project",
-            "shiny": random.randrange(SHINY_CHANCE) == 0,
+            "shiny": shiny,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         })
+        register_species(state, base["species_id"], base["name"], shiny)
         state["unclaimed"] -= 1
         update_display(state)
         save_state(state)
@@ -1363,6 +1544,9 @@ def main():
         active["species_id"] = target["species_id"]
         active["name"] = target["name"]
         active["announced_stage"] = None
+        # A new form is a new Pokedex entry — the old one stays registered.
+        register_species(state, target["species_id"], target["name"],
+                         bool(active.get("shiny")))
 
         events = [{"type": "evolution", "from": was, "to": target["name"],
                    "species_id": target["species_id"],

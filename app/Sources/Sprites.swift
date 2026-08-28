@@ -129,7 +129,39 @@ enum Sprites {
     /// `.sourceAtop`, which paints only where pixels already exist. Filling a
     /// background first instead would tint the background too and return a
     /// solid white rectangle.
-    static func silhouette(_ path: String) -> NSImage? {
+    /// Silhouettes are built often enough in the Pokedex grid — 649 cells, each
+    /// decoding a GIF — that rebuilding them on every scroll is wasteful. NSCache
+    /// evicts under memory pressure on its own, which matters on a machine whose
+    /// swap is already loaded.
+    private static let silhouetteCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 250
+        return cache
+    }()
+
+    /// White by default, which is what the evolution animation wants. The
+    /// Pokedex passes a label colour instead: a white silhouette on the light
+    /// theme's panel would be invisible.
+    static func silhouette(_ path: String, color: NSColor = .white) -> NSImage? {
+        // Keyed on the resolved colour, not the NSColor itself: a dynamic system
+        // colour describes itself identically in both appearances ("Catalog
+        // color: System secondaryLabelColor") while rendering black in light and
+        // white in dark. The bitmap is baked at lockFocus time, so a shared key
+        // meant that switching appearance left every silhouette painted for the
+        // old one — black on a dark panel, invisible — until the app restarted.
+        // Resolved against the app's appearance explicitly rather than whatever
+        // drawing appearance happens to be current inside a SwiftUI body, so the
+        // key and the pixels it labels are always derived from the same one.
+        var resolved = color
+        let appearance = NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB) ?? color
+        }
+        let key = String(format: "%@|%.3f,%.3f,%.3f,%.3f", path,
+                         resolved.redComponent, resolved.greenComponent,
+                         resolved.blueComponent, resolved.alphaComponent) as NSString
+        if let cached = silhouetteCache.object(forKey: key) { return cached }
+
         guard let data = FileManager.default.contents(atPath: path),
               let rep = NSBitmapImageRep(data: data) else { return nil }
         rep.setProperty(.currentFrame, withValue: 0)
@@ -139,9 +171,13 @@ enum Sprites {
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .none
         rep.draw(in: box)
-        NSColor.white.setFill()
+        resolved.setFill()
+        // sourceAtop paints only where pixels already exist. Filling a
+        // background first tints that too and yields a solid rectangle.
         box.fill(using: .sourceAtop)
         image.unlockFocus()
+
+        silhouetteCache.setObject(image, forKey: key)
         return image
     }
 

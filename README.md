@@ -6,7 +6,7 @@ earn XP. Retire it whenever you like and it goes into Bill's PC at the level it
 reached, or push it to 100 for the badge — the pace of the collection is yours.
 Nothing stored there is final: pull one back out and keep raising it.
 
-<img src="docs/img/panel.png" alt="Charizard at level 72 in the macOS menu bar, with the panel open showing its type, XP bar, a team of three and Bill's PC" width="311">
+<img src="docs/img/panel.png" alt="Charizard at level 72 in the macOS menu bar, with the panel open showing its type, XP bar, a team of three, a Pokedex at 5 of 649 and Bill's PC" width="320">
 
 ```
 statusline  🌿 main  |  🤖 Opus 5 [high]  |  🔥 Charizard Lv.82 [████████░░] 84%
@@ -89,8 +89,37 @@ keeps the team from becoming storage: filling the last slot means retiring
 someone first, and retiring still needs level 40. Without a limit a dozen
 Pokémon would sit at level 5 forever and the collection would never grow.
 
-Retiring with someone on the bench hands training straight to them instead of
-asking for a new species, which is also how a slot is freed.
+Retiring with someone on the bench asks what should happen to the slot it
+leaves. Promoting whoever is next frees it, which is how the team shrinks;
+starting a new species instead keeps the team the same size and leaves the
+retired one waiting in the PC. An earlier version promoted silently, and that
+quietly capped the team at two — the only way to add a member is for a new
+Pokémon to enter the world, and promoting never creates one.
+
+A slot is filled from the PC and nowhere else. The panel will not hand out a
+fresh species on request, because that would bypass both routes that make
+getting a Pokémon mean something — retiring one at the floor, or being awarded
+one for starting a project — and turn the roster into something asked for rather
+than earned.
+
+Starting a new species costs progress: a Pokémon that has not gained a level
+since it was last put in the PC has achieved nothing to be paid for, and the
+option is refused. Without that, one already-trained Pokémon could be retired and
+withdrawn over and over, filling the team with free level-1 species while earning
+no XP at all. Promoting the bench is never gated, because it hands out nothing.
+
+So the team grows by one for every **level gained past the last time a Pokémon
+was filed**, with no separate currency to track:
+
+```
+train to Lv.40 → retire, start a new species → the trained one waits in the PC
+                                                        │
+                                            take it back out → the team is one bigger
+```
+
+Starting fresh with a species the panel does not offer is still possible from
+the command line (`party <id>`), which exists for setting up a state rather than
+for playing.
 
 With a full team, and only then, any member can be put in the PC at whatever
 level it is. That is the way out of a team filled by accident: freeing a slot
